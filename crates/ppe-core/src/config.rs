@@ -168,6 +168,26 @@ pub struct EngineSettings {
     /// investigate the entity-name growth.
     #[serde(default = "default_route_cache_max_entries")]
     pub route_cache_max_entries: usize,
+
+    /// Path to a durable write-ahead log for irreversible effects: token
+    /// mints, approval grants.
+    ///
+    /// With a path set, a plugin's intent is recorded and `fsync`'d before it
+    /// acts, so a process that dies mid-act leaves a record to reconcile
+    /// against the participant. Unset (the default) leaves effects
+    /// unrecorded: they still run, and a plugin behaves identically either
+    /// way. Auditing is a choice the operator makes, not one a plugin
+    /// depends on.
+    #[serde(default)]
+    pub effect_log_path: Option<String>,
+
+    /// Appends between automatic compactions of the effect log.
+    ///
+    /// Only meaningful with `effect_log_path` set. `0` disables automatic
+    /// compaction, leaving it to the recovery run at startup. Unset uses the
+    /// built-in default.
+    #[serde(default)]
+    pub effect_log_compaction_threshold: Option<usize>,
 }
 
 impl Default for EngineSettings {
@@ -177,6 +197,8 @@ impl Default for EngineSettings {
             plugin_timeout: 30,
             short_circuit_on_deny: true,
             route_cache_max_entries: default_route_cache_max_entries(),
+            effect_log_path: None,
+            effect_log_compaction_threshold: None,
         }
     }
 }

@@ -30,6 +30,7 @@ use tracing::{error, warn};
 use crate::audit::AuditHandler;
 use crate::context::PluginContextTable;
 use crate::decision::{DecisionLog, PluginAction, Verdict};
+use crate::effect::{DurableEffectLog, EffectLogSlot, EffectSink};
 use crate::error::PluginError;
 use crate::extensions::filter_extensions;
 use crate::hooks::payload::{Extensions, PluginPayload, WriteToken};
@@ -295,6 +296,11 @@ pub struct Executor {
     /// Set when the engine builds the runtime snapshot, empty otherwise.
     /// They receive the decision log but cannot influence the outcome.
     audit_handlers: Vec<Arc<dyn AuditHandler>>,
+
+    /// Where an irreversible effect gets recorded. `None` when the operator
+    /// configured neither a log nor a sink, in which case a plugin's effects
+    /// run unrecorded and the slot costs no allocation per invocation.
+    effect_sink: Option<Arc<EffectSink>>,
 }
 
 impl Executor {
@@ -303,13 +309,44 @@ impl Executor {
         Self {
             config,
             audit_handlers: Vec::new(),
+            effect_sink: None,
         }
+    }
+
+    /// Install the durable log that irreversible effects are written to.
+    ///
+    /// Without one, effects still reach any audit sink but are not crash-safe:
+    /// nothing survives a restart, so recovery has nothing to reconcile.
+    #[must_use]
+    pub fn with_effect_log(mut self, effect_log: Arc<dyn DurableEffectLog>) -> Self {
+        self.rebuild_effect_sink(Some(effect_log));
+        self
+    }
+
+    /// The installed effect log, for the engine to run recovery at startup.
+    pub fn effect_log(&self) -> Option<Arc<dyn DurableEffectLog>> {
+        self.effect_sink.as_ref().and_then(|s| s.log())
+    }
+
+    /// Rebuild the shared sink from the current log and audit handlers.
+    ///
+    /// The sink is a projection of both, so anything that changes either has
+    /// to re-run this or plugins keep being handed the previous pairing.
+    fn rebuild_effect_sink(&mut self, log: Option<Arc<dyn DurableEffectLog>>) {
+        let sink = EffectSink::new(log, self.audit_handlers.clone());
+        self.effect_sink = if sink.is_empty() {
+            None
+        } else {
+            Some(Arc::new(sink))
+        };
     }
 
     /// Attach observation-only audit sinks, invoked at the verdict of every
     /// pipeline run. Used by the engine when it builds the runtime snapshot.
     pub fn with_audit_handlers(mut self, audit_handlers: Vec<Arc<dyn AuditHandler>>) -> Self {
         self.audit_handlers = audit_handlers;
+        let log = self.effect_log();
+        self.rebuild_effect_sink(log);
         self
     }
 
@@ -318,6 +355,8 @@ impl Executor {
     /// on the same terms as one that arrived through config.
     pub fn set_audit_handlers(&mut self, audit_handlers: Vec<Arc<dyn AuditHandler>>) {
         self.audit_handlers = audit_handlers;
+        let log = self.effect_log();
+        self.rebuild_effect_sink(log);
     }
 
     /// Emit one allow record for an invocation that resolved to zero plugins,
@@ -611,14 +650,51 @@ impl Executor {
             if capabilities.contains("append_delegation") {
                 filtered.delegation_write_token = Some(WriteToken::new());
             }
+            // Effects are permitted here because a serial plugin runs to
+            // completion and its result is honored. The slot is only built
+            // when something would record the effect; otherwise the default
+            // already permits it and records nothing.
+            filtered.effect_log = if !phase.permits_effects() {
+                EffectLogSlot::not_permitted(phase)
+            } else if let Some(sink) = &self.effect_sink {
+                EffectLogSlot::recorded(Arc::clone(sink), plugin_name)
+            } else {
+                EffectLogSlot::unrecorded()
+            };
 
-            // Execute with timeout — handler borrows payload, gets filtered extensions
+            // Execute with timeout — handler borrows payload, gets filtered
+            // extensions. Panics are contained the way the concurrent phase
+            // contains them. A panic between recording an effect's intent and
+            // recording its outcome would otherwise unwind the whole request
+            // future; collapsing it into a `PluginError` lets `on_error`
+            // decide, keeps the pipeline's bookkeeping intact, and leaves the
+            // orphaned intent for recovery instead of losing the request.
+            use futures::FutureExt as _;
             let timeout_dur = Duration::from_secs(self.config.timeout_seconds);
             let result = timeout(
                 timeout_dur,
-                entry.handler.invoke(&**payload, &filtered, &mut ctx),
+                std::panic::AssertUnwindSafe(entry.handler.invoke(&**payload, &filtered, &mut ctx))
+                    .catch_unwind(),
             )
-            .await;
+            .await
+            .map(|caught| {
+                caught.unwrap_or_else(|panic| {
+                    let msg = panic
+                        .downcast_ref::<&'static str>()
+                        .map(|s| (*s).to_owned())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".to_owned());
+                    error!("{} plugin '{}' panicked: {}", phase_label, plugin_name, msg);
+                    Err(Box::new(crate::error::PluginError::Execution {
+                        plugin_name: plugin_name.to_owned(),
+                        message: format!("task panicked: {msg}"),
+                        source: None,
+                        code: Some("panic".into()),
+                        details: std::collections::HashMap::new(),
+                        proto_error_code: None,
+                    }))
+                })
+            });
 
             match result {
                 Ok(Ok(result_box)) => {
@@ -805,12 +881,24 @@ impl Executor {
                     // If no modifications — payload unchanged
                 },
                 Ok(Err(e)) => {
+                    // A contained panic carries code "panic". Surfacing it as
+                    // `plugin_panic` lets a host or a sink tell a crash from an
+                    // ordinary plugin error by code, in either phase.
+                    let is_panic = matches!(
+                        e.as_ref(),
+                        crate::error::PluginError::Execution { code: Some(c), .. }
+                            if c.as_str() == "panic"
+                    );
                     error!("{} plugin '{}' failed: {}", phase_label, plugin_name, e);
                     action = PluginAction::Error(e.to_string());
                     match on_error {
                         OnError::Fail if can_block => {
                             let mut v = crate::error::PluginViolation::new(
-                                "plugin_error",
+                                if is_panic {
+                                    "plugin_panic"
+                                } else {
+                                    "plugin_error"
+                                },
                                 format!("Plugin '{plugin_name}' failed: {e}"),
                             );
                             v.plugin_name = Some(plugin_name.to_owned());
@@ -920,7 +1008,11 @@ impl Executor {
                 .iter()
                 .cloned()
                 .collect();
-            let filtered = filter_extensions(extensions, &capabilities);
+            let mut filtered = filter_extensions(extensions, &capabilities);
+            // Refused here: this phase's work is cancelled or discarded
+            // when the pipeline short-circuits, and an external act is not.
+            filtered.effect_log =
+                EffectLogSlot::not_permitted(entry.plugin_ref.trusted_config().mode);
             let timeout_dur = Duration::from_secs(self.config.timeout_seconds);
 
             let result = timeout(
@@ -1052,7 +1144,13 @@ impl Executor {
                 .iter()
                 .cloned()
                 .collect();
-            let filtered = Arc::new(filter_extensions(extensions, &capabilities));
+            let filtered = Arc::new({
+                let mut f = filter_extensions(extensions, &capabilities);
+                // Refused here: this phase's work is cancelled or discarded
+                // when the pipeline short-circuits, and an external act is not.
+                f.effect_log = EffectLogSlot::not_permitted(entry.plugin_ref.trusted_config().mode);
+                f
+            });
 
             branches.push(Box::pin(async move {
                 match handler.invoke(&**payload_clone, &filtered, &mut ctx).await {
@@ -1311,7 +1409,13 @@ impl Executor {
                 .iter()
                 .cloned()
                 .collect();
-            let filtered = Arc::new(filter_extensions(extensions, &capabilities));
+            let filtered = Arc::new({
+                let mut f = filter_extensions(extensions, &capabilities);
+                // Refused here: this phase's work is cancelled or discarded
+                // when the pipeline short-circuits, and an external act is not.
+                f.effect_log = EffectLogSlot::not_permitted(entry.plugin_ref.trusted_config().mode);
+                f
+            });
 
             // Spawn through TaskTracker so `PolicyEngine::shutdown()`
             // can drain in-flight fire-and-forget tasks before tearing
@@ -2209,5 +2313,222 @@ mod audit_seam_tests {
 
         assert!(matches!(log.verdict(), Some(Verdict::Allow)));
         assert_eq!(log.steps().len(), 1);
+    }
+
+    // =====================================================================
+    // Effects, as the executor wires them
+    // =====================================================================
+    //
+    // The slot tests in `effect` cover the bracket itself. These cover the
+    // part only the executor decides: which phase gets which slot.
+
+    /// Performs an effect and reports whether it was allowed to act.
+    struct EffectPlugin {
+        cfg: PluginConfig,
+        acted: Arc<std::sync::atomic::AtomicBool>,
+        refused: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Plugin for EffectPlugin {
+        fn config(&self) -> &PluginConfig {
+            &self.cfg
+        }
+    }
+
+    #[async_trait]
+    impl AnyHookHandler for EffectPlugin {
+        async fn invoke(
+            &self,
+            _payload: &dyn PluginPayload,
+            extensions: &Extensions,
+            _ctx: &mut PluginContext,
+        ) -> Result<Box<dyn std::any::Any + Send + Sync>, Box<PluginError>> {
+            let effect = crate::effect::EffectRecord::prepared("token_mint", "d", "k-1");
+            let acted = Arc::clone(&self.acted);
+            let outcome: Result<(), Box<PluginError>> = extensions
+                .perform_effect(&effect, || async move {
+                    acted.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })
+                .await;
+            if outcome.is_err() {
+                self.refused
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(erase_result(PluginResult::<P>::allow()))
+        }
+
+        fn hook_type_name(&self) -> &'static str {
+            "test_hook"
+        }
+    }
+
+    /// Runs one effect-performing plugin in `mode`, returning
+    /// (acted, refused, records written).
+    async fn run_effect_in(mode: PluginMode) -> (bool, bool, Vec<crate::effect::EffectRecord>) {
+        #[derive(Debug, Default)]
+        struct SpyLog(Mutex<Vec<crate::effect::EffectRecord>>);
+
+        #[async_trait]
+        impl crate::effect::DurableEffectLog for SpyLog {
+            async fn append(
+                &self,
+                effect: &crate::effect::EffectRecord,
+            ) -> Result<(), Box<PluginError>> {
+                self.0.lock().unwrap().push(effect.clone());
+                Ok(())
+            }
+        }
+
+        let log = Arc::new(SpyLog::default());
+        let acted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cfg = PluginConfig {
+            name: "minter".into(),
+            mode,
+            on_error: OnError::Ignore,
+            ..Default::default()
+        };
+        let entry = HookEntry {
+            plugin_ref: Arc::new(PluginRef::new(
+                Arc::new(EffectPlugin {
+                    cfg: cfg.clone(),
+                    acted: Arc::clone(&acted),
+                    refused: Arc::clone(&refused),
+                }),
+                cfg,
+            )),
+            handler: Arc::new(EffectPlugin {
+                cfg: PluginConfig::default(),
+                acted: Arc::clone(&acted),
+                refused: Arc::clone(&refused),
+            }),
+        };
+
+        let executor = Executor::new(ExecutorConfig {
+            timeout_seconds: 5,
+            short_circuit_on_deny: true,
+        })
+        .with_effect_log(log.clone());
+        let tracker = tokio_util::task::TaskTracker::new();
+        let payload: Box<dyn PluginPayload> = Box::new(P("in".into()));
+        let (_r, bg) = executor
+            .execute(
+                std::slice::from_ref(&entry),
+                payload,
+                Extensions::default(),
+                None,
+                &tracker,
+            )
+            .await;
+        bg.wait_for_background_tasks().await;
+
+        let seen = log.0.lock().unwrap().clone();
+        (
+            acted.load(std::sync::atomic::Ordering::SeqCst),
+            refused.load(std::sync::atomic::Ordering::SeqCst),
+            seen,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_sequential_plugin_may_act_and_the_act_is_recorded() {
+        let (acted, refused, seen) = run_effect_in(PluginMode::Sequential).await;
+
+        assert!(acted, "a serial plugin runs to completion, so it may act");
+        assert!(!refused);
+        assert_eq!(seen.len(), 2, "intent then outcome");
+        assert_eq!(seen[0].plugin_name.as_deref(), Some("minter"));
+    }
+
+    /// A concurrent branch is cancelled when another branch short-circuits the
+    /// phase, so an act there could happen for work the pipeline threw away.
+    #[tokio::test]
+    async fn a_concurrent_plugin_is_refused_and_does_not_act() {
+        let (acted, refused, seen) = run_effect_in(PluginMode::Concurrent).await;
+
+        assert!(!acted, "the act must not run");
+        assert!(
+            refused,
+            "and the plugin is told why, rather than silently no-oping"
+        );
+        assert!(seen.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_audit_phase_plugin_is_refused() {
+        let (acted, refused, _) = run_effect_in(PluginMode::Audit).await;
+
+        assert!(!acted);
+        assert!(refused);
+    }
+
+    #[tokio::test]
+    async fn a_fire_and_forget_plugin_is_refused() {
+        let (acted, refused, _) = run_effect_in(PluginMode::FireAndForget).await;
+
+        assert!(
+            !acted,
+            "this phase runs after the verdict is already returned"
+        );
+        assert!(refused);
+    }
+
+    /// Without panic containment a panicking serial plugin unwinds the request
+    /// future, which loses the verdict and, once effects exist, strands an
+    /// intent with nothing to reconcile it against.
+    #[tokio::test]
+    async fn a_panicking_serial_plugin_is_contained_and_named() {
+        struct Panicker(PluginConfig);
+
+        #[async_trait]
+        impl Plugin for Panicker {
+            fn config(&self) -> &PluginConfig {
+                &self.0
+            }
+        }
+
+        #[async_trait]
+        impl AnyHookHandler for Panicker {
+            async fn invoke(
+                &self,
+                _p: &dyn PluginPayload,
+                _e: &Extensions,
+                _c: &mut PluginContext,
+            ) -> Result<Box<dyn std::any::Any + Send + Sync>, Box<PluginError>> {
+                panic!("simulated panic in a serial plugin");
+            }
+
+            fn hook_type_name(&self) -> &'static str {
+                "test_hook"
+            }
+        }
+
+        let cfg = PluginConfig {
+            name: "boom".into(),
+            mode: PluginMode::Sequential,
+            on_error: OnError::Fail,
+            ..Default::default()
+        };
+        let entry = HookEntry {
+            plugin_ref: Arc::new(PluginRef::new(Arc::new(Panicker(cfg.clone())), cfg.clone())),
+            handler: Arc::new(Panicker(cfg)),
+        };
+        let rec = Arc::new(Recorder::default());
+        let (result, _) = run(std::slice::from_ref(&entry), vec![rec.clone()]).await;
+
+        let violation = result
+            .violation
+            .expect("a panic under on_error: fail denies");
+        assert_eq!(
+            violation.code, "plugin_panic",
+            "a crash is distinguishable from an ordinary plugin error"
+        );
+        assert_eq!(
+            rec.calls().len(),
+            1,
+            "and the verdict still reaches the audit sinks"
+        );
     }
 }

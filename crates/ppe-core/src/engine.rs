@@ -847,12 +847,47 @@ fn register_instances_into(
 /// settings on `policy_config`. Pulls executor timeout / short-circuit and
 /// the route-cache cap from `engine_settings` so both registration paths
 /// agree on field-by-field translation.
-fn snapshot_from_config(registry: PluginRegistry, policy_config: PolicyConfig) -> RuntimeSnapshot {
-    let executor = Executor::new(ExecutorConfig {
+fn snapshot_from_config(
+    registry: PluginRegistry,
+    policy_config: PolicyConfig,
+    prev: Option<&RuntimeSnapshot>,
+) -> RuntimeSnapshot {
+    let mut executor = Executor::new(ExecutorConfig {
         timeout_seconds: policy_config.engine_settings.plugin_timeout,
         short_circuit_on_deny: policy_config.engine_settings.short_circuit_on_deny,
     })
     .with_audit_handlers(registry.audit_handlers());
+
+    if let Some(path) = &policy_config.engine_settings.effect_log_path {
+        // Reuse the running log when a reload leaves the path unchanged. Two
+        // `FileEffectLog` values over one file hold independent append locks,
+        // so an in-flight request still on the old snapshot could append while
+        // the new one compacts, and the rename would drop that record. The
+        // path is the log's identity; a changed compaction threshold on an
+        // unchanged path waits for the next restart.
+        let reused = prev
+            .filter(|p| {
+                p.policy_config
+                    .as_ref()
+                    .and_then(|c| c.engine_settings.effect_log_path.as_ref())
+                    == Some(path)
+            })
+            .and_then(|p| p.executor.effect_log());
+        let log = if let Some(existing) = reused {
+            existing
+        } else {
+            let mut file_log = crate::effect::FileEffectLog::new(path);
+            if let Some(threshold) = policy_config
+                .engine_settings
+                .effect_log_compaction_threshold
+            {
+                file_log = file_log.with_compaction_threshold(threshold);
+            }
+            let built: Arc<dyn crate::effect::DurableEffectLog> = Arc::new(file_log);
+            built
+        };
+        executor = executor.with_effect_log(log);
+    }
     let route_cache_max_entries = policy_config.engine_settings.route_cache_max_entries;
     let http_routes_declaring_authentication = http_routes_declaring_authentication(&policy_config);
     let declares_assertions = declares_assertions(&policy_config);
@@ -913,6 +948,43 @@ impl PolicyEngine {
             task_tracker: tokio_util::task::TaskTracker::new(),
             visitors: RwLock::new(Vec::new()),
             http_transport: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Reconcile any effects a previous run left mid-flight, using the
+    /// default reconciler ([`crate::effect::LogUnknownsReconciler`]).
+    ///
+    /// Completed effects are compacted away and unresolved ones are returned.
+    /// A no-op when no effect log is configured. `initialize` calls this
+    /// already; call it directly only to sweep again later.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the effect log cannot be read or rewritten.
+    pub async fn recover_effects(
+        &self,
+    ) -> Result<Vec<crate::effect::EffectRecord>, Box<PluginError>> {
+        self.recover_effects_with(&crate::effect::LogUnknownsReconciler)
+            .await
+    }
+
+    /// Like [`Self::recover_effects`], with a reconciler that can resolve an
+    /// unknown effect by looking up [`crate::effect::EffectRecord::key`] in an
+    /// authoritative ledger.
+    ///
+    /// The reconciler reads the self-describing record, so it is specific to
+    /// the participant at most, never to the plugin that caused the effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the effect log cannot be read or rewritten.
+    pub async fn recover_effects_with(
+        &self,
+        reconciler: &dyn crate::effect::EffectReconciler,
+    ) -> Result<Vec<crate::effect::EffectRecord>, Box<PluginError>> {
+        match self.load_runtime().executor.effect_log() {
+            Some(log) => log.recover_and_reconcile(reconciler).await,
+            None => Ok(Vec::new()),
         }
     }
 
@@ -1133,8 +1205,11 @@ impl PolicyEngine {
         let registered =
             register_instances_into(&mut new_registry, &policy_config.plugins, &instances);
         if registered.is_ok() {
-            self.runtime
-                .store(Arc::new(snapshot_from_config(new_registry, policy_config)));
+            self.runtime.store(Arc::new(snapshot_from_config(
+                new_registry,
+                policy_config,
+                Some(current.as_ref()),
+            )));
             // Same generation bump as mutate_runtime — load_config doesn't
             // go through that helper because it has to swap registry + executor
             // + cache-cap atomically as one snapshot.
@@ -1410,9 +1485,11 @@ impl PolicyEngine {
         let mut new_registry = PluginRegistry::new();
         register_instances_into(&mut new_registry, &policy_config.plugins, &instances)?;
 
-        engine
-            .runtime
-            .store(Arc::new(snapshot_from_config(new_registry, policy_config)));
+        engine.runtime.store(Arc::new(snapshot_from_config(
+            new_registry,
+            policy_config,
+            None,
+        )));
 
         Ok(engine)
     }
@@ -1657,6 +1734,24 @@ impl PolicyEngine {
 
                 initialized_plugins.push(plugin_name);
             }
+        }
+
+        // Reconcile whatever a previous run left mid-flight, once, before any
+        // traffic. Without this an orphaned intent sits in the log forever and
+        // the write-ahead record never becomes an answer about what happened.
+        // Best-effort: the append path is independently fail-closed, so a
+        // failure to read the log here is reported rather than fatal, and does
+        // not stop an engine from coming up.
+        match self.recover_effects().await {
+            Ok(unresolved) if !unresolved.is_empty() => {
+                warn!(
+                    "effect log recovery left {} effect(s) unresolved; investigate, or \
+                     install a reconciler that can confirm them by key",
+                    unresolved.len()
+                );
+            },
+            Ok(_) => {},
+            Err(e) => error!("effect log recovery failed at startup: {e}"),
         }
 
         self.initialized.store(true, Ordering::Release);
@@ -9503,6 +9598,132 @@ routes:
             1,
             "an unregistered sink stops receiving verdicts"
         );
+    }
+
+    // =====================================================================
+    // The effect log, as config wires it
+    // =====================================================================
+
+    fn effect_log_path(tag: &str) -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "ppe_engine_{tag}_{}_{n}.ndjson",
+            std::process::id()
+        ))
+    }
+
+    struct RemoveOnDrop(std::path::PathBuf);
+
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_file(self.0.with_extension("recover.tmp"));
+        }
+    }
+
+    /// No `effect_log_path` is the default, and it must leave the engine with
+    /// nothing to recover rather than half-configured.
+    #[tokio::test]
+    async fn without_a_configured_path_there_is_no_effect_log() {
+        let engine = PolicyEngine::default();
+        engine
+            .load_config(PolicyConfig::default())
+            .expect("an empty config loads");
+
+        assert!(engine.recover_effects().await.unwrap().is_empty());
+    }
+
+    /// An intent with no outcome is what a crash mid-mint leaves behind.
+    /// Startup has to find it, or the record never becomes an answer.
+    #[tokio::test]
+    async fn startup_recovery_surfaces_an_effect_left_mid_flight() {
+        let path = effect_log_path("orphan");
+        let _c = RemoveOnDrop(path.clone());
+        std::fs::write(
+            &path,
+            br#"{"kind":"token_mint","description":"d","key":"k-1","state":"prepared","details":{},"plugin_name":"delegator"}
+"#,
+        )
+        .unwrap();
+
+        let mut config = PolicyConfig::default();
+        config.engine_settings.effect_log_path = Some(path.display().to_string());
+        let engine = PolicyEngine::default();
+        engine.load_config(config).unwrap();
+
+        let unresolved = engine.recover_effects().await.unwrap();
+
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].key, "k-1");
+        // The default reconciler cannot confirm it, so it stays for an
+        // operator rather than being written off as never having happened.
+        assert_eq!(unresolved[0].state, crate::effect::EffectState::Prepared);
+    }
+
+    /// A completed effect is not something to reconcile, so recovery drops it.
+    #[tokio::test]
+    async fn startup_recovery_compacts_a_completed_effect() {
+        let path = effect_log_path("done");
+        let _c = RemoveOnDrop(path.clone());
+        std::fs::write(
+            &path,
+            br#"{"kind":"token_mint","description":"d","key":"k-1","state":"prepared","details":{},"plugin_name":null}
+{"kind":"token_mint","description":"d","key":"k-1","state":"confirmed","details":{},"plugin_name":null}
+"#,
+        )
+        .unwrap();
+
+        let mut config = PolicyConfig::default();
+        config.engine_settings.effect_log_path = Some(path.display().to_string());
+        let engine = PolicyEngine::default();
+        engine.load_config(config).unwrap();
+
+        assert!(engine.recover_effects().await.unwrap().is_empty());
+    }
+
+    /// Two `FileEffectLog` values over one file hold independent append locks,
+    /// so a reload that rebuilt the log could let an in-flight request append
+    /// while the new one compacts, and the rename would drop that record.
+    #[tokio::test]
+    async fn a_reload_on_an_unchanged_path_keeps_the_running_log() {
+        let path = effect_log_path("reload");
+        let _c = RemoveOnDrop(path.clone());
+
+        let mut config = PolicyConfig::default();
+        config.engine_settings.effect_log_path = Some(path.display().to_string());
+        let engine = PolicyEngine::default();
+        engine.load_config(config.clone()).unwrap();
+        let before = engine.load_runtime().executor.effect_log().unwrap();
+
+        engine.load_config(config).unwrap();
+        let after = engine.load_runtime().executor.effect_log().unwrap();
+
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "the same path must keep the same log instance across a reload"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reload_onto_a_different_path_builds_a_new_log() {
+        let first = effect_log_path("path_a");
+        let second = effect_log_path("path_b");
+        let _a = RemoveOnDrop(first.clone());
+        let _b = RemoveOnDrop(second.clone());
+
+        let engine = PolicyEngine::default();
+        let mut config = PolicyConfig::default();
+        config.engine_settings.effect_log_path = Some(first.display().to_string());
+        engine.load_config(config).unwrap();
+        let before = engine.load_runtime().executor.effect_log().unwrap();
+
+        let mut moved = PolicyConfig::default();
+        moved.engine_settings.effect_log_path = Some(second.display().to_string());
+        engine.load_config(moved).unwrap();
+        let after = engine.load_runtime().executor.effect_log().unwrap();
+
+        assert!(!Arc::ptr_eq(&before, &after));
     }
 }
 

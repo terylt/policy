@@ -10,6 +10,7 @@ use praxis_policy_core::audit::AuditHandler;
 use praxis_policy_core::cmf::{CmfHook, ContentPart, MessagePayload};
 use praxis_policy_core::context::PluginContext;
 use praxis_policy_core::decision::{DecisionLog, PluginAction, Verdict};
+use praxis_policy_core::effect::EffectRecord;
 use praxis_policy_core::error::{PluginError, PluginViolation};
 use praxis_policy_core::hooks::payload::{Extensions, PluginPayload};
 use praxis_policy_core::hooks::trait_def::{HookHandler, PluginResult};
@@ -190,6 +191,33 @@ impl Plugin for AuditLogger {
 }
 
 impl AuditLogger {
+    /// The effect record: the request's ambient context plus the act itself.
+    ///
+    /// Emitted as its own event rather than folded into the decision, because
+    /// an effect happened to the outside world and outlives the request that
+    /// caused it. The ambient fields are what let a reader tie the two back
+    /// together.
+    fn build_effect_record(&self, effect: &EffectRecord, ext: &Extensions) -> Value {
+        let mut record = match self.build_record(None, ext) {
+            Value::Object(map) => map,
+            // `build_record` always returns an object. Anything else means no
+            // ambient context, which is not a reason to drop the effect.
+            _ => Map::new(),
+        };
+        record.insert("event".into(), json!("effect"));
+        record.insert("effect_kind".into(), json!(effect.kind));
+        record.insert("effect_state".into(), json!(effect.state));
+        record.insert("effect_key".into(), json!(effect.key));
+        record.insert("effect_description".into(), json!(effect.description));
+        if let Some(plugin) = &effect.plugin_name {
+            record.insert("effect_plugin".into(), json!(plugin));
+        }
+        if !effect.details.is_empty() {
+            record.insert("effect_details".into(), json!(effect.details));
+        }
+        Value::Object(record)
+    }
+
     /// The decision record: the observation record's fields plus the
     /// pipeline's verdict and the ordered plugin actions.
     ///
@@ -272,6 +300,11 @@ impl AuditHandler for AuditLogger {
     ) {
         let cmf = payload.as_any().downcast_ref::<MessagePayload>();
         let record = self.build_decision_record(cmf, extensions, decisions);
+        self.emit(&record);
+    }
+
+    async fn on_effect(&self, effect: &EffectRecord, ext: &Extensions) {
+        let record = self.build_effect_record(effect, ext);
         self.emit(&record);
     }
 
@@ -704,5 +737,43 @@ mod tests {
 
         // And the sink path itself tolerates it.
         AuditHandler::handle(&plugin, &Other, &Extensions::default(), &log).await;
+    }
+
+    /// An effect is its own event, not part of a decision record: it happened
+    /// to the outside world and outlives the request that caused it.
+    #[test]
+    fn an_effect_is_recorded_as_its_own_event() {
+        use praxis_policy_core::effect::{EffectRecord, EffectState};
+
+        let plugin = AuditLogger::new(sink_cfg()).unwrap();
+        let mut effect = EffectRecord::prepared("token_mint", "exchange for workday", "k-1")
+            .with_detail("audience", "workday-api")
+            .into_state(EffectState::Confirmed);
+        effect.plugin_name = Some("delegator".into());
+
+        let record = plugin.build_effect_record(&effect, &Extensions::default());
+
+        assert_eq!(record["event"], "effect");
+        assert_eq!(record["effect_kind"], "token_mint");
+        assert_eq!(record["effect_state"], "confirmed");
+        assert_eq!(record["effect_key"], "k-1");
+        // Attribution is the framework's, so a reader can trust which plugin
+        // caused the act.
+        assert_eq!(record["effect_plugin"], "delegator");
+        assert_eq!(record["effect_details"]["audience"], "workday-api");
+    }
+
+    /// The intent is recorded before the act, so a reader sees a prepared
+    /// record with no outcome when a process died mid-mint.
+    #[test]
+    fn an_unfinished_effect_renders_as_prepared() {
+        use praxis_policy_core::effect::EffectRecord;
+
+        let plugin = AuditLogger::new(sink_cfg()).unwrap();
+        let effect = EffectRecord::prepared("token_mint", "d", "k-2");
+
+        let record = plugin.build_effect_record(&effect, &Extensions::default());
+
+        assert_eq!(record["effect_state"], "prepared");
     }
 }

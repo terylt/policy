@@ -16,6 +16,7 @@
 use async_trait::async_trait;
 
 use crate::decision::DecisionLog;
+use crate::effect::EffectRecord;
 use crate::hooks::payload::{Extensions, PluginPayload};
 
 /// An observation-only consumer of pipeline decisions.
@@ -47,6 +48,17 @@ pub trait AuditHandler: Send + Sync {
         extensions: &Extensions,
         decisions: &DecisionLog,
     );
+
+    /// Observe an irreversible external act a plugin caused, as its own event
+    /// separate from the per-invocation decision.
+    ///
+    /// Fired at each lifecycle transition, so a sink sees the intent before
+    /// the act and the outcome after. `extensions` carries the same ambient
+    /// context a decision gets, so a sink can correlate the effect with the
+    /// request that caused it rather than working from the record alone.
+    ///
+    /// The default ignores effects, for a sink that only cares about verdicts.
+    async fn on_effect(&self, _effect: &EffectRecord, _extensions: &Extensions) {}
 
     /// A short identifier used in error logs when a sink panics or times out.
     fn name(&self) -> &str {

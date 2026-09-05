@@ -19,6 +19,7 @@
 // - [`context`] — PluginContext (local_state + global_state)
 // - [`audit`] — AuditHandler, the observation-only verdict sink
 // - [`decision`] — DecisionLog, the executor's record of a pipeline run
+// - [`effect`] — irreversible external acts, recorded write-ahead
 // - [`cmf`] — ContextForge Message Format (Message, ContentPart, enums)
 // - [`identity`] — IdentityResolve hook family (subject / client /
 //                   workload resolution from raw credentials)
@@ -48,6 +49,8 @@ pub mod context;
 pub mod decision;
 /// The token delegation hook and its payload.
 pub mod delegation;
+/// Irreversible external effects and the write-ahead log that records them.
+pub mod effect;
 /// The elicitation hook, for out-of-band human approval.
 pub mod elicitation;
 /// Plugin lifecycle and hook dispatch.

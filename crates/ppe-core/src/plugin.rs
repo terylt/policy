@@ -569,6 +569,18 @@ impl PluginMode {
     pub fn is_awaited(&self) -> bool {
         !matches!(self, Self::FireAndForget | Self::Disabled)
     }
+
+    /// Whether a plugin in this mode may perform an irreversible external
+    /// effect (a token mint, an approval grant).
+    ///
+    /// Only the serial phases qualify. A concurrent branch is cancelled when
+    /// another branch short-circuits the phase, an audit-phase plugin is
+    /// read-only by contract, and fire-and-forget runs after the verdict is
+    /// already returned. In each of those an external act would happen for
+    /// work the pipeline discarded, and an external act cannot be discarded.
+    pub fn permits_effects(&self) -> bool {
+        matches!(self, Self::Sequential | Self::Transform)
+    }
 }
 
 impl fmt::Display for PluginMode {
