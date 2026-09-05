@@ -17,6 +17,16 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Every verdict now reaches an audit sink, denials included.** An observation-only plugin runs as a post-hook, so it only ever saw traffic that was allowed through: a blocked call, an approval rejection, or a delegation failure produced no audit record at all. The executor now builds a `DecisionLog` recording what each plugin did and how the pipeline ruled, and hands it to any registered sink at the verdict itself rather than in a pipeline phase, so allow, deny, and modify all produce exactly one record. A hook resolving to zero plugins emits one allow record too, so a consumer counting records per invocation does not read "nothing configured" as a dropped record.
+
+  A plugin becomes a sink by overriding `Plugin::as_audit_handler`. Sinks return `()`, so a sink can see a verdict but cannot influence it, and the decision log never reaches `PluginContext`, so an ordinary plugin cannot read what the sink reads. Sink calls are bounded by the plugin timeout with panics contained: a sink that fails is logged and skipped rather than taking down the request whose verdict is already decided.
+
+  Opt-in and off by default. With no sink registered the executor builds the log but emits nothing, and the cost is a length check.
+
+- **The reference `audit-logger` runs as a decision sink.** Listing no `hooks:` is no longer a configuration error: it selects sink mode, where the logger attaches to the verdict path and records the verdict and the ordered plugin actions alongside the fields it already emitted. Listing hooks keeps the previous per-hook observer, which continues to see only allowed traffic, so one instance never emits two records for one request.
+
 ## [0.2.0] - 2026-09-03
 
 > **Upgrading from 0.1.0?** Configurations require changes: this release removes ten keys, changes the default dispatch mode, and tightens APL lexical rules. `docs/upgrade-apl.md` lists the required rewrites with before-and-after examples.

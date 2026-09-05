@@ -19,6 +19,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -133,6 +134,16 @@ pub trait Plugin: Send + Sync {
     /// Default implementation does nothing.
     async fn shutdown(&self) -> Result<(), Box<PluginError>> {
         Ok(())
+    }
+
+    /// If this plugin is also an audit sink, return it as one so the engine
+    /// attaches it to the executor's verdict emit when the plugin is
+    /// registered, config-driven registration included.
+    ///
+    /// A sink sees the verdict and every plugin's action but returns nothing,
+    /// so it cannot influence the outcome it records. Default: not a sink.
+    fn as_audit_handler(self: Arc<Self>) -> Option<Arc<dyn crate::audit::AuditHandler>> {
+        None
     }
 }
 
@@ -609,7 +620,6 @@ mod tests {
     use super::*;
     use crate::extensions::{MCPExtension, MetaExtension, SecurityExtension, SubjectExtension};
     use crate::hooks::payload::Extensions;
-    use std::sync::Arc;
 
     // The mode predicates decide whether a plugin is allowed to block the
     // pipeline or rewrite the payload. Nothing called them, so a wrong answer

@@ -27,7 +27,9 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{error, warn};
 
+use crate::audit::AuditHandler;
 use crate::context::PluginContextTable;
+use crate::decision::{DecisionLog, PluginAction, Verdict};
 use crate::error::PluginError;
 use crate::extensions::filter_extensions;
 use crate::hooks::payload::{Extensions, PluginPayload, WriteToken};
@@ -132,6 +134,11 @@ pub struct PipelineResult {
     /// Plugin contexts indexed by plugin ID. Thread this into the
     /// next hook invocation to preserve per-plugin `local_state`.
     pub context_table: PluginContextTable,
+
+    /// What each plugin did and how the pipeline ruled. Built by the
+    /// executor and handed to audit sinks; never reaches plugins through
+    /// `PluginContext`.
+    pub decision_log: DecisionLog,
 }
 
 impl PipelineResult {
@@ -150,6 +157,7 @@ impl PipelineResult {
             errors: Vec::new(),
             metadata: None,
             context_table,
+            decision_log: DecisionLog::new(),
         }
     }
 
@@ -176,7 +184,14 @@ impl PipelineResult {
             errors: Vec::new(),
             metadata: None,
             context_table,
+            decision_log: DecisionLog::new(),
         }
+    }
+
+    /// Attach the executor's decision log to a constructed result.
+    pub fn with_decision_log(mut self, decision_log: DecisionLog) -> Self {
+        self.decision_log = decision_log;
+        self
     }
 
     /// Replace the errors vec on a constructed `PipelineResult`. Used by
@@ -269,17 +284,102 @@ impl fmt::Debug for BackgroundTasks {
 /// SEQUENTIAL → TRANSFORM → AUDIT → CONCURRENT → FIRE_AND_FORGET
 /// ```
 ///
-/// The executor is stateless — all state comes from the arguments.
-/// One executor instance can serve multiple concurrent hook invocations.
+/// The executor's only state is its config and the attached audit sinks;
+/// all per-request state comes from the arguments. One executor instance
+/// can serve multiple concurrent hook invocations.
 #[derive(Clone)]
 pub struct Executor {
     config: ExecutorConfig,
+
+    /// Observation-only sinks invoked at the verdict of every pipeline run.
+    /// Set when the engine builds the runtime snapshot, empty otherwise.
+    /// They receive the decision log but cannot influence the outcome.
+    audit_handlers: Vec<Arc<dyn AuditHandler>>,
 }
 
 impl Executor {
     /// Create a new executor with the given configuration.
     pub fn new(config: ExecutorConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            audit_handlers: Vec::new(),
+        }
+    }
+
+    /// Attach observation-only audit sinks, invoked at the verdict of every
+    /// pipeline run. Used by the engine when it builds the runtime snapshot.
+    pub fn with_audit_handlers(mut self, audit_handlers: Vec<Arc<dyn AuditHandler>>) -> Self {
+        self.audit_handlers = audit_handlers;
+        self
+    }
+
+    /// Replace the attached audit sinks. The engine calls this after a
+    /// registry mutation so a sink registered programmatically is attached
+    /// on the same terms as one that arrived through config.
+    pub fn set_audit_handlers(&mut self, audit_handlers: Vec<Arc<dyn AuditHandler>>) {
+        self.audit_handlers = audit_handlers;
+    }
+
+    /// Emit one allow record for an invocation that resolved to zero plugins,
+    /// so the audit stream carries one record per invocation rather than
+    /// falling silent where nothing was configured.
+    ///
+    /// A no-op when no sink is attached, so an unaudited host pays only a
+    /// length check. The engine calls this at its zero-plugin short-circuits,
+    /// which return before reaching `execute`.
+    pub(crate) async fn emit_empty_allow(
+        &self,
+        payload: &dyn PluginPayload,
+        extensions: &Extensions,
+    ) {
+        if self.audit_handlers.is_empty() {
+            return;
+        }
+        let mut decisions = DecisionLog::new();
+        decisions.finalize(Verdict::Allow);
+        self.emit_audit(payload, extensions, &decisions).await;
+    }
+
+    /// Hand the finalized decision to every audit sink, once per pipeline run.
+    async fn emit_audit(
+        &self,
+        payload: &dyn PluginPayload,
+        extensions: &Extensions,
+        decisions: &DecisionLog,
+    ) {
+        use futures::FutureExt as _;
+        use std::panic::AssertUnwindSafe;
+
+        if self.audit_handlers.is_empty() {
+            return;
+        }
+
+        // The verdict is already decided, so a sink must not be able to crash
+        // or hang the request it is only observing. Each call is bounded by
+        // the plugin timeout and its panics contained; a sink that fails is
+        // logged and skipped. A lost audit record is a problem in itself, but
+        // not one that justifies failing the request.
+        let timeout_dur = Duration::from_secs(self.config.timeout_seconds);
+        for handler in &self.audit_handlers {
+            let call =
+                AssertUnwindSafe(handler.handle(payload, extensions, decisions)).catch_unwind();
+            match timeout(timeout_dur, call).await {
+                Ok(Ok(())) => {},
+                Ok(Err(_panic)) => {
+                    error!(
+                        "audit sink '{}' panicked during emit, contained",
+                        handler.name()
+                    );
+                },
+                Err(_elapsed) => {
+                    error!(
+                        "audit sink '{}' exceeded {}s during emit, skipped",
+                        handler.name(),
+                        timeout_dur.as_secs()
+                    );
+                },
+            }
+        }
     }
 
     /// Execute a hook invocation through the 5-phase pipeline.
@@ -311,6 +411,12 @@ impl Executor {
         let mut ctx_table = context_table.unwrap_or_default();
 
         if entries.is_empty() {
+            // A hook resolving to zero plugins is normal (nothing configured
+            // for this entity). It still emits one allow record so the stream
+            // stays dense at one record per invocation. The engine
+            // short-circuits most zero-plugin invocations before reaching
+            // here and emits itself; this covers a direct `execute(&[], ..)`.
+            self.emit_empty_allow(&*payload, &extensions).await;
             return (
                 PipelineResult::allowed_with(payload, extensions, ctx_table),
                 BackgroundTasks::empty(),
@@ -333,6 +439,11 @@ impl Executor {
         // read an exact signal instead of comparing payload contents.
         let mut payload_modified = false;
 
+        // What each plugin did and how the pipeline ruled. Threaded through
+        // the phases, finalized at each return point, and attached to the
+        // result for audit sinks.
+        let mut decisions = DecisionLog::new();
+
         if let Some(v) = self
             .run_serial_phase(
                 &sequential,
@@ -343,12 +454,18 @@ impl Executor {
                 true, // can_modify
                 "SEQUENTIAL",
                 &mut errors,
+                &mut decisions,
                 &mut payload_modified,
             )
             .await
         {
+            decisions.finalize(Verdict::Deny(v.clone()));
+            self.emit_audit(&*current_payload, &current_extensions, &decisions)
+                .await;
             return (
-                PipelineResult::denied(v, current_extensions, ctx_table).with_errors(errors),
+                PipelineResult::denied(v, current_extensions, ctx_table)
+                    .with_errors(errors)
+                    .with_decision_log(decisions),
                 BackgroundTasks::empty(),
             );
         }
@@ -364,6 +481,7 @@ impl Executor {
             true,  // can_modify
             "TRANSFORM",
             &mut errors,
+            &mut decisions,
             &mut payload_modified,
         )
         .await;
@@ -385,12 +503,17 @@ impl Executor {
                 &current_extensions,
                 &ctx_table,
                 &mut errors,
+                &mut decisions,
             )
             .await
         {
+            decisions.finalize(Verdict::Deny(violation.clone()));
+            self.emit_audit(&*current_payload, &current_extensions, &decisions)
+                .await;
             return (
                 PipelineResult::denied(violation, current_extensions, ctx_table)
-                    .with_errors(errors),
+                    .with_errors(errors)
+                    .with_decision_log(decisions),
                 BackgroundTasks::empty(),
             );
         }
@@ -406,9 +529,13 @@ impl Executor {
             task_tracker,
         );
 
+        decisions.finalize(Verdict::Allow);
+        self.emit_audit(&*current_payload, &current_extensions, &decisions)
+            .await;
         (
             PipelineResult::allowed_with(current_payload, current_extensions, ctx_table)
                 .with_errors(errors)
+                .with_decision_log(decisions)
                 .with_payload_modified(payload_modified),
             BackgroundTasks::from_handles(bg_handles),
         )
@@ -440,6 +567,7 @@ impl Executor {
         can_modify: bool,
         phase_label: &str,
         errors: &mut Vec<crate::error::PluginErrorRecord>,
+        decisions: &mut DecisionLog,
         payload_modified: &mut bool,
     ) -> Option<crate::error::PluginViolation> {
         for entry in entries {
@@ -450,6 +578,10 @@ impl Executor {
             let plugin_name = entry.plugin_ref.name();
             let plugin_id = entry.plugin_ref.id();
             let on_error = entry.plugin_ref.trusted_config().on_error;
+            let phase = entry.plugin_ref.trusted_config().mode;
+            // What this plugin did, recorded once after it runs, or inline
+            // on the paths that return before the end of the loop body.
+            let mut action = PluginAction::Allowed;
 
             // Take this plugin's context out of the table — pulls its stored
             // local_state and seeds global_state from the canonical store.
@@ -490,24 +622,47 @@ impl Executor {
 
             match result {
                 Ok(Ok(result_box)) => {
-                    if let Some(erased) = extract_erased(result_box) {
+                    if let Some(mut erased) = extract_erased(result_box) {
                         if !erased.continue_processing && can_block {
                             // A blocking result always halts; synthesize a violation
                             // when the plugin did not provide one.
-                            let mut v = erased.violation.unwrap_or_else(|| {
+                            let mut v = erased.violation.take().unwrap_or_else(|| {
                                 crate::error::PluginViolation::new(
                                     "plugin_deny",
                                     format!("Plugin '{plugin_name}' denied"),
                                 )
                             });
                             v.plugin_name = Some(plugin_name.to_owned());
+                            decisions.record(
+                                plugin_name,
+                                phase,
+                                PluginAction::Denied(Box::new(v.clone())),
+                            );
                             return Some(v);
                         }
 
+                        // A stop signalled from a phase that cannot block
+                        // (Transform) is suppressed: the pipeline proceeds.
+                        // It is recorded as the plugin's actual intent rather
+                        // than as an allow, and its modifications are skipped,
+                        // since it asked to halt rather than to shape.
+                        let deny_ignored = !erased.continue_processing && !can_block;
+                        if deny_ignored {
+                            let mut v = erased.violation.take().unwrap_or_else(|| {
+                                crate::error::PluginViolation::new(
+                                    "plugin_deny",
+                                    format!("Plugin '{plugin_name}' denied"),
+                                )
+                            });
+                            v.plugin_name = Some(plugin_name.to_owned());
+                            action = PluginAction::DenyIgnored(Box::new(v));
+                        }
+
                         // Accept modifications
-                        if can_modify {
+                        if can_modify && !deny_ignored {
                             if let Some(mp) = erased.modified_payload {
                                 *payload = mp;
+                                action = PluginAction::ModifiedPayload;
                                 *payload_modified = true;
                             }
                             if let Some(mut owned) = erased.modified_extensions {
@@ -598,6 +753,9 @@ impl Executor {
                                     );
                                 } else {
                                     extensions.merge_owned(owned);
+                                    if action == PluginAction::Allowed {
+                                        action = PluginAction::ModifiedExtensions;
+                                    }
                                 }
                             }
                         }
@@ -621,6 +779,7 @@ impl Executor {
                             details: std::collections::HashMap::new(),
                             proto_error_code: None,
                         };
+                        action = PluginAction::Error(e.to_string());
                         match on_error {
                             OnError::Fail if can_block => {
                                 let mut v = crate::error::PluginViolation::new(
@@ -628,6 +787,7 @@ impl Executor {
                                     format!("Plugin '{plugin_name}' failed: {e}"),
                                 );
                                 v.plugin_name = Some(plugin_name.to_owned());
+                                decisions.record(plugin_name, phase, action.clone());
                                 return Some(v);
                             },
                             OnError::Fail => {
@@ -646,6 +806,7 @@ impl Executor {
                 },
                 Ok(Err(e)) => {
                     error!("{} plugin '{}' failed: {}", phase_label, plugin_name, e);
+                    action = PluginAction::Error(e.to_string());
                     match on_error {
                         OnError::Fail if can_block => {
                             let mut v = crate::error::PluginViolation::new(
@@ -653,6 +814,7 @@ impl Executor {
                                 format!("Plugin '{plugin_name}' failed: {e}"),
                             );
                             v.plugin_name = Some(plugin_name.to_owned());
+                            decisions.record(plugin_name, phase, action.clone());
                             return Some(v);
                         },
                         // Any non-halt outcome (Fail-in-non-blocking-phase,
@@ -686,6 +848,7 @@ impl Executor {
                         timeout_ms: u64::try_from(timeout_dur.as_millis()).unwrap_or(u64::MAX),
                         proto_error_code: None,
                     };
+                    action = PluginAction::Error("timed out".to_owned());
                     match on_error {
                         OnError::Fail if can_block => {
                             let mut v = crate::error::PluginViolation::new(
@@ -693,6 +856,7 @@ impl Executor {
                                 format!("Plugin '{plugin_name}' timed out"),
                             );
                             v.plugin_name = Some(plugin_name.to_owned());
+                            decisions.record(plugin_name, phase, action.clone());
                             return Some(v);
                         },
                         OnError::Fail => {
@@ -716,6 +880,10 @@ impl Executor {
                     }
                 },
             }
+
+            // Record what this plugin did. The halting paths above record
+            // inline and return before reaching here.
+            decisions.record(plugin_name, phase, action);
 
             // Commit this plugin's context back to the table — replaces the
             // canonical global_state with its (possibly modified) copy and
@@ -828,6 +996,7 @@ impl Executor {
         extensions: &Extensions,
         ctx_table: &PluginContextTable,
         errors: &mut Vec<crate::error::PluginErrorRecord>,
+        decisions: &mut DecisionLog,
     ) -> Option<crate::error::PluginViolation> {
         use praxis_policy_orchestration::{
             BranchConfig, BranchOutcome, ErasedBranch, run_branches,
@@ -966,19 +1135,45 @@ impl Executor {
         {
             let plugin_name = entry.plugin_ref.name();
 
+            // Record what this branch did, in input order. Done before the
+            // policy match below, which may return on the first halting
+            // outcome and would otherwise drop the record.
+            // A concurrent branch may deny without supplying a violation, and
+            // only the first denial becomes the verdict. Both the record and
+            // the verdict resolve it the same way so a plugin's objection
+            // reads identically wherever it is consumed from.
+            let deny_violation = |opt_v: Option<crate::error::PluginViolation>| {
+                let mut v = opt_v.unwrap_or_else(|| {
+                    crate::error::PluginViolation::new(
+                        "concurrent_deny",
+                        format!("Plugin '{plugin_name}' denied"),
+                    )
+                });
+                v.plugin_name = Some(plugin_name.to_owned());
+                v
+            };
+
+            let action = match &outcome {
+                BranchOutcome::Completed(BranchData::Allow) => PluginAction::Allowed,
+                BranchOutcome::Completed(BranchData::Deny(opt_v)) => {
+                    PluginAction::Denied(Box::new(deny_violation(opt_v.clone())))
+                },
+                BranchOutcome::Completed(BranchData::Error(e)) => {
+                    PluginAction::Error(e.to_string())
+                },
+                BranchOutcome::TimedOut => PluginAction::Error("timed out".to_owned()),
+                BranchOutcome::Panicked(s) => PluginAction::Error(format!("panicked: {s}")),
+                // Cancelled because another branch short-circuited the phase:
+                // an intentional abort, not a crash.
+                BranchOutcome::Aborted => PluginAction::Aborted,
+            };
+            decisions.record(plugin_name, entry.plugin_ref.trusted_config().mode, action);
+
             match outcome {
                 BranchOutcome::Completed(BranchData::Allow) => {},
                 BranchOutcome::Completed(BranchData::Deny(opt_v)) => {
-                    let violation = opt_v.unwrap_or_else(|| {
-                        let mut v = crate::error::PluginViolation::new(
-                            "concurrent_deny",
-                            format!("Plugin '{plugin_name}' denied"),
-                        );
-                        v.plugin_name = Some(plugin_name.to_owned());
-                        v
-                    });
                     if first_violation.is_none() {
-                        first_violation = Some(violation);
+                        first_violation = Some(deny_violation(opt_v));
                     }
                 },
                 BranchOutcome::Completed(BranchData::Error(e)) => match on_error {
@@ -1672,5 +1867,347 @@ mod tests {
             "Debug is what a failing assertion prints"
         );
         assert!(bg.wait_for_background_tasks().await.is_empty());
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unwrap_used,
+    reason = "tests"
+)]
+mod audit_seam_tests {
+    //! The audit seam: every verdict reaches the sinks.
+    //!
+    //! The gap these cover is that an observation-only plugin runs as a
+    //! post-hook and so only ever sees traffic that was allowed through. A
+    //! blocked call produced no record at all. The load-bearing cases here are
+    //! the deny ones; the allow cases exist so a passing deny test cannot be
+    //! passing for an unrelated reason.
+
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::context::PluginContext;
+    use crate::decision::DecisionStep;
+    use crate::error::PluginViolation;
+    use crate::hooks::PluginResult;
+    use crate::plugin::{Plugin, PluginConfig, PluginMode};
+    use crate::registry::{AnyHookHandler, PluginRef};
+
+    #[derive(Debug, Clone)]
+    #[allow(dead_code, reason = "test payload: the typed shape is the point")]
+    struct P(String);
+    crate::impl_plugin_payload!(P);
+
+    /// What a sink was handed, kept so a test can assert on it after the
+    /// pipeline has returned.
+    #[derive(Default)]
+    struct Recorder {
+        seen: Mutex<Vec<(bool, Vec<DecisionStep>)>>,
+    }
+
+    impl Recorder {
+        fn calls(&self) -> Vec<(bool, Vec<DecisionStep>)> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl AuditHandler for Recorder {
+        async fn handle(
+            &self,
+            _payload: &dyn PluginPayload,
+            _extensions: &Extensions,
+            decisions: &DecisionLog,
+        ) {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((decisions.is_denied(), decisions.steps().to_vec()));
+        }
+    }
+
+    /// A sink that panics. The verdict is already decided when it runs, so it
+    /// must not be able to take the request down with it.
+    struct PanickingSink;
+
+    #[async_trait]
+    impl AuditHandler for PanickingSink {
+        async fn handle(&self, _p: &dyn PluginPayload, _e: &Extensions, _d: &DecisionLog) {
+            panic!("sink blew up");
+        }
+    }
+
+    /// What a mock plugin does when invoked.
+    #[derive(Clone, Copy)]
+    enum Act {
+        Allow,
+        Deny,
+        ModifyPayload,
+        Error,
+    }
+
+    struct MockPlugin(PluginConfig);
+
+    #[async_trait]
+    impl Plugin for MockPlugin {
+        fn config(&self) -> &PluginConfig {
+            &self.0
+        }
+    }
+
+    struct MockHandler(Act);
+
+    #[async_trait]
+    impl AnyHookHandler for MockHandler {
+        async fn invoke(
+            &self,
+            _payload: &dyn PluginPayload,
+            _extensions: &Extensions,
+            _ctx: &mut PluginContext,
+        ) -> Result<Box<dyn std::any::Any + Send + Sync>, Box<PluginError>> {
+            Ok(match self.0 {
+                Act::Allow => erase_result(PluginResult::<P>::allow()),
+                Act::Deny => erase_result(PluginResult::<P>::deny(PluginViolation::new(
+                    "blocked", "nope",
+                ))),
+                Act::ModifyPayload => {
+                    erase_result(PluginResult::modify_payload(P("changed".into())))
+                },
+                Act::Error => {
+                    return Err(Box::new(PluginError::Execution {
+                        plugin_name: "mock".into(),
+                        message: "boom".into(),
+                        source: None,
+                        code: None,
+                        details: std::collections::HashMap::new(),
+                        proto_error_code: None,
+                    }));
+                },
+            })
+        }
+
+        fn hook_type_name(&self) -> &'static str {
+            "test_hook"
+        }
+    }
+
+    fn entry(name: &str, mode: PluginMode, act: Act) -> HookEntry {
+        let cfg = PluginConfig {
+            name: name.into(),
+            mode,
+            on_error: OnError::Ignore,
+            ..Default::default()
+        };
+        HookEntry {
+            plugin_ref: Arc::new(PluginRef::new(Arc::new(MockPlugin(cfg.clone())), cfg)),
+            handler: Arc::new(MockHandler(act)),
+        }
+    }
+
+    async fn run(
+        entries: &[HookEntry],
+        sinks: Vec<Arc<dyn AuditHandler>>,
+    ) -> (PipelineResult, DecisionLog) {
+        let executor = Executor::new(ExecutorConfig {
+            timeout_seconds: 5,
+            short_circuit_on_deny: true,
+        })
+        .with_audit_handlers(sinks);
+        let tracker = tokio_util::task::TaskTracker::new();
+        let payload: Box<dyn PluginPayload> = Box::new(P("in".into()));
+        let (result, _bg) = executor
+            .execute(entries, payload, Extensions::default(), None, &tracker)
+            .await;
+        let log = result.decision_log.clone();
+        (result, log)
+    }
+
+    #[tokio::test]
+    async fn an_allowed_run_emits_one_record_with_a_step_per_plugin() {
+        let rec = Arc::new(Recorder::default());
+        let entries = [
+            entry("a", PluginMode::Sequential, Act::Allow),
+            entry("b", PluginMode::Sequential, Act::Allow),
+        ];
+        let (result, _) = run(&entries, vec![rec.clone()]).await;
+
+        assert!(result.continue_processing);
+        let calls = rec.calls();
+        assert_eq!(calls.len(), 1, "exactly one record per invocation");
+        let (denied, steps) = &calls[0];
+        assert!(!denied);
+        assert_eq!(
+            steps
+                .iter()
+                .map(|s| s.plugin_name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"],
+            "steps are in execution order"
+        );
+    }
+
+    /// The reason the seam exists. A post-hook observer never runs on this
+    /// path, so before the verdict emit a blocked call produced no record.
+    #[tokio::test]
+    async fn a_denied_run_still_emits_a_record_naming_the_denying_plugin() {
+        let rec = Arc::new(Recorder::default());
+        let entries = [
+            entry("first", PluginMode::Sequential, Act::Allow),
+            entry("blocker", PluginMode::Sequential, Act::Deny),
+            entry("never", PluginMode::Sequential, Act::Allow),
+        ];
+        let (result, log) = run(&entries, vec![rec.clone()]).await;
+
+        assert!(result.is_denied());
+        let calls = rec.calls();
+        assert_eq!(calls.len(), 1);
+        let (denied, steps) = &calls[0];
+        assert!(
+            denied,
+            "the sink sees the deny, not just the allowed traffic"
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .map(|s| s.plugin_name.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "blocker"],
+            "the plugin after the short-circuit never ran, so it has no step"
+        );
+        match &steps[1].action {
+            PluginAction::Denied(v) => assert_eq!(v.code, "blocked"),
+            other => panic!("expected a deny step, got {other:?}"),
+        }
+        assert!(matches!(log.verdict(), Some(Verdict::Deny(v)) if v.code == "blocked"));
+    }
+
+    #[tokio::test]
+    async fn a_concurrent_deny_emits_a_record() {
+        let rec = Arc::new(Recorder::default());
+        let entries = [entry("gate", PluginMode::Concurrent, Act::Deny)];
+        let (result, _) = run(&entries, vec![rec.clone()]).await;
+
+        assert!(result.is_denied());
+        let calls = rec.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].0);
+        assert!(matches!(calls[0].1[0].action, PluginAction::Denied(_)));
+    }
+
+    /// Transform cannot block, so the deny is suppressed and the pipeline
+    /// proceeds. Recording it as `Allowed` would tell a consumer the plugin
+    /// permitted the request when it asked to stop it.
+    #[tokio::test]
+    async fn a_block_from_transform_is_recorded_as_deny_ignored() {
+        let rec = Arc::new(Recorder::default());
+        let entries = [entry("shaper", PluginMode::Transform, Act::Deny)];
+        let (result, _) = run(&entries, vec![rec.clone()]).await;
+
+        assert!(result.continue_processing, "transform cannot block");
+        let calls = rec.calls();
+        // The verdict is an allow and names nothing, so this step is the only
+        // place the objection survives. A bare marker would record that a
+        // plugin objected without recording what it objected to.
+        match &calls[0].1[0].action {
+            PluginAction::DenyIgnored(v) => {
+                assert_eq!(v.code, "blocked");
+                assert_eq!(v.reason, "nope");
+                assert_eq!(v.plugin_name.as_deref(), Some("shaper"));
+            },
+            other => panic!("expected a suppressed deny, got {other:?}"),
+        }
+    }
+
+    /// Only the first concurrent denial becomes the verdict. The others are
+    /// still real objections, and each step carries its own reason rather than
+    /// every branch pointing at whichever one happened to land first.
+    #[tokio::test]
+    async fn every_concurrent_denial_keeps_its_own_reason() {
+        let rec = Arc::new(Recorder::default());
+        let entries = [
+            entry("gate_a", PluginMode::Concurrent, Act::Deny),
+            entry("gate_b", PluginMode::Concurrent, Act::Deny),
+        ];
+        let (result, _) = run(&entries, vec![rec.clone()]).await;
+
+        assert!(result.is_denied());
+        let calls = rec.calls();
+        let denials: Vec<&str> = calls[0]
+            .1
+            .iter()
+            .filter_map(|s| match &s.action {
+                PluginAction::Denied(v) => v.plugin_name.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            denials,
+            ["gate_a", "gate_b"],
+            "each denying branch is attributed to itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_payload_modification_is_recorded_as_such() {
+        let rec = Arc::new(Recorder::default());
+        let entries = [entry("shaper", PluginMode::Transform, Act::ModifyPayload)];
+        let (_, _) = run(&entries, vec![rec.clone()]).await;
+
+        assert_eq!(rec.calls()[0].1[0].action, PluginAction::ModifiedPayload);
+    }
+
+    #[tokio::test]
+    async fn a_plugin_error_is_recorded_as_an_error_step() {
+        let rec = Arc::new(Recorder::default());
+        let entries = [entry("flaky", PluginMode::Sequential, Act::Error)];
+        let (result, _) = run(&entries, vec![rec.clone()]).await;
+
+        assert!(result.continue_processing, "on_error: ignore continues");
+        assert!(matches!(rec.calls()[0].1[0].action, PluginAction::Error(_)));
+    }
+
+    /// A hook that resolves to no plugins still produces a record, so a
+    /// consumer counting records per invocation does not read "nothing
+    /// configured" as a dropped record.
+    #[tokio::test]
+    async fn a_zero_plugin_run_emits_one_allow_record() {
+        let rec = Arc::new(Recorder::default());
+        let (_, _) = run(&[], vec![rec.clone()]).await;
+
+        let calls = rec.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0].0);
+        assert!(calls[0].1.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_panicking_sink_does_not_disturb_the_verdict() {
+        let rec = Arc::new(Recorder::default());
+        let entries = [entry("a", PluginMode::Sequential, Act::Allow)];
+        let (result, _) = run(&entries, vec![Arc::new(PanickingSink), rec.clone()]).await;
+
+        assert!(result.continue_processing, "the request survives the sink");
+        assert_eq!(
+            rec.calls().len(),
+            1,
+            "a later sink still runs after an earlier one panics"
+        );
+    }
+
+    /// No sink attached is the default, and it must cost nothing beyond the
+    /// verdict itself still being recorded on the result.
+    #[tokio::test]
+    async fn with_no_sink_the_pipeline_still_carries_its_decision_log() {
+        let entries = [entry("a", PluginMode::Sequential, Act::Allow)];
+        let (_, log) = run(&entries, Vec::new()).await;
+
+        assert!(matches!(log.verdict(), Some(Verdict::Allow)));
+        assert_eq!(log.steps().len(), 1);
     }
 }

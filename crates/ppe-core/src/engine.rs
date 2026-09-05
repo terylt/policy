@@ -851,7 +851,8 @@ fn snapshot_from_config(registry: PluginRegistry, policy_config: PolicyConfig) -
     let executor = Executor::new(ExecutorConfig {
         timeout_seconds: policy_config.engine_settings.plugin_timeout,
         short_circuit_on_deny: policy_config.engine_settings.short_circuit_on_deny,
-    });
+    })
+    .with_audit_handlers(registry.audit_handlers());
     let route_cache_max_entries = policy_config.engine_settings.route_cache_max_entries;
     let http_routes_declaring_authentication = http_routes_declaring_authentication(&policy_config);
     let declares_assertions = declares_assertions(&policy_config);
@@ -868,6 +869,17 @@ fn snapshot_from_config(registry: PluginRegistry, policy_config: PolicyConfig) -
         http_routes_declaring_assertions,
         declares_glob_named_routes,
     }
+}
+
+/// Re-derive the executor's audit sinks from the registry.
+///
+/// The sinks are a projection of the registered plugins, so anything that
+/// adds or removes a plugin has to re-run it. A sink left attached after its
+/// plugin is unregistered would keep receiving verdicts, and one registered
+/// after the snapshot was built would silently receive none.
+fn reattach_audit_handlers(snap: &mut RuntimeSnapshot) {
+    let handlers = snap.registry.audit_handlers();
+    snap.executor.set_audit_handlers(handlers);
 }
 
 impl PolicyEngine {
@@ -1445,7 +1457,9 @@ impl PolicyEngine {
         self.try_mutate_runtime(|snap| {
             snap.registry
                 .register::<H>(plugin, config, handler)
-                .map_err(|msg| Box::new(PluginError::Config { message: msg }))
+                .map_err(|msg| Box::new(PluginError::Config { message: msg }))?;
+            reattach_audit_handlers(snap);
+            Ok::<(), Box<PluginError>>(())
         })?;
         self.clear_routing_cache();
         Ok(())
@@ -1485,7 +1499,9 @@ impl PolicyEngine {
         self.try_mutate_runtime(|snap| {
             snap.registry
                 .register_for_names::<H>(plugin, config, handler, names)
-                .map_err(|msg| Box::new(PluginError::Config { message: msg }))
+                .map_err(|msg| Box::new(PluginError::Config { message: msg }))?;
+            reattach_audit_handlers(snap);
+            Ok::<(), Box<PluginError>>(())
         })?;
         self.clear_routing_cache();
         Ok(())
@@ -1510,7 +1526,9 @@ impl PolicyEngine {
         self.try_mutate_runtime(|snap| {
             snap.registry
                 .register::<H>(plugin, config, handler)
-                .map_err(|msg| Box::new(PluginError::Config { message: msg }))
+                .map_err(|msg| Box::new(PluginError::Config { message: msg }))?;
+            reattach_audit_handlers(snap);
+            Ok::<(), Box<PluginError>>(())
         })?;
         self.clear_routing_cache();
         Ok(())
@@ -1730,6 +1748,10 @@ impl PolicyEngine {
             // contract written on a route holds whether or not this hook has a
             // plugin on it.
             let matched = resolve_contract_route(&snapshot, &extensions);
+            snapshot
+                .executor
+                .emit_empty_allow(&*payload, &extensions)
+                .await;
             return (
                 self.apply_assertions(
                     &snapshot,
@@ -1766,8 +1788,11 @@ impl PolicyEngine {
                 );
             },
         };
-
         if entries.is_empty() {
+            snapshot
+                .executor
+                .emit_empty_allow(&*payload, &extensions)
+                .await;
             return (
                 self.apply_assertions(
                     &snapshot,
@@ -1845,6 +1870,10 @@ impl PolicyEngine {
         if all_entries.is_empty() && snapshot.route_annotations.is_empty() {
             let boxed: Box<dyn PluginPayload> = Box::new(payload);
             let matched = resolve_contract_route(&snapshot, &extensions);
+            snapshot
+                .executor
+                .emit_empty_allow(&*boxed, &extensions)
+                .await;
             return (
                 self.apply_assertions(
                     &snapshot,
@@ -1881,9 +1910,12 @@ impl PolicyEngine {
                 );
             },
         };
-
         if entries.is_empty() {
             let boxed: Box<dyn PluginPayload> = Box::new(payload);
+            snapshot
+                .executor
+                .emit_empty_allow(&*boxed, &extensions)
+                .await;
             return (
                 self.apply_assertions(
                     &snapshot,
@@ -1972,6 +2004,10 @@ impl PolicyEngine {
         if all_entries.is_empty() && snapshot.route_annotations.is_empty() {
             let boxed: Box<dyn PluginPayload> = Box::new(payload);
             let matched = resolve_contract_route(&snapshot, &extensions);
+            snapshot
+                .executor
+                .emit_empty_allow(&*boxed, &extensions)
+                .await;
             return (
                 self.apply_assertions(
                     &snapshot,
@@ -2008,9 +2044,12 @@ impl PolicyEngine {
                 );
             },
         };
-
         if entries.is_empty() {
             let boxed: Box<dyn PluginPayload> = Box::new(payload);
+            snapshot
+                .executor
+                .emit_empty_allow(&*boxed, &extensions)
+                .await;
             return (
                 self.apply_assertions(
                     &snapshot,
@@ -2097,6 +2136,10 @@ impl PolicyEngine {
         self.warn_if_dispatch_has_no_boundary(&snapshot);
         if entries.is_empty() {
             let boxed: Box<dyn PluginPayload> = Box::new(payload);
+            snapshot
+                .executor
+                .emit_empty_allow(&*boxed, &extensions)
+                .await;
             return (
                 // `None`, so nothing is applied. Not an omission: this is a
                 // nested dispatch primitive rather than a wire boundary, and
@@ -3245,7 +3288,11 @@ impl PolicyEngine {
 
     /// Unregister a plugin by name.
     pub fn unregister(&self, name: &str) -> Option<Arc<PluginRef>> {
-        let removed = self.mutate_runtime(|snap| snap.registry.unregister(name));
+        let removed = self.mutate_runtime(|snap| {
+            let removed = snap.registry.unregister(name);
+            reattach_audit_handlers(snap);
+            removed
+        });
         if removed.is_some() {
             self.clear_routing_cache();
         }
@@ -9370,6 +9417,92 @@ routes:
         let events = Events::default();
         SINK.with_borrow_mut(|sink| *sink = Some(events.clone()));
         (events, Sink)
+    }
+
+    // =====================================================================
+    // Audit sinks
+    // =====================================================================
+    //
+    // The sinks the executor emits to are a projection of the registry, so
+    // anything that adds or removes a plugin has to re-derive them. A sink
+    // left attached after its plugin is gone keeps receiving verdicts; one
+    // registered after the snapshot was built receives none.
+
+    struct SinkPlugin {
+        cfg: PluginConfig,
+        seen: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Plugin for SinkPlugin {
+        fn config(&self) -> &PluginConfig {
+            &self.cfg
+        }
+
+        fn as_audit_handler(self: Arc<Self>) -> Option<Arc<dyn crate::audit::AuditHandler>> {
+            Some(self)
+        }
+    }
+
+    #[async_trait]
+    impl crate::audit::AuditHandler for SinkPlugin {
+        async fn handle(
+            &self,
+            _payload: &dyn PluginPayload,
+            _extensions: &Extensions,
+            _decisions: &crate::decision::DecisionLog,
+        ) {
+            self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl HookHandler<TestHook> for SinkPlugin {
+        async fn handle(
+            &self,
+            _payload: &TestPayload,
+            _ext: &Extensions,
+            _ctx: &mut PluginContext,
+        ) -> PluginResult<TestPayload> {
+            PluginResult::allow()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_registered_sink_receives_the_verdict_and_stops_when_unregistered() {
+        let engine = PolicyEngine::default();
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cfg = make_config("sink", 10, PluginMode::Sequential);
+        engine
+            .register_handler::<TestHook, _>(
+                Arc::new(SinkPlugin {
+                    cfg: cfg.clone(),
+                    seen: Arc::clone(&seen),
+                }),
+                cfg,
+            )
+            .unwrap();
+
+        let payload = TestPayload {
+            value: "x".to_owned(),
+        };
+        let (_r, _bg) = engine
+            .invoke::<TestHook>(payload.clone(), Extensions::default(), None)
+            .await;
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a sink registered programmatically is attached, not only one from config"
+        );
+
+        engine.unregister("sink");
+        let (_r, _bg) = engine
+            .invoke::<TestHook>(payload, Extensions::default(), None)
+            .await;
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an unregistered sink stops receiving verdicts"
+        );
     }
 }
 
