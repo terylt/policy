@@ -264,6 +264,52 @@ impl AuditLogger {
                 })
                 .collect();
             map.insert("decision_steps".into(), json!(steps));
+
+            // This invocation's place in the decision graph: its own span, the
+            // upstream call that triggered it, and the trace they share.
+            if let Some(span) = decisions.span() {
+                map.insert(
+                    "span".into(),
+                    json!({
+                        "trace_id": span.trace_id,
+                        "span_id": span.span_id,
+                        "parent_span_id": span.parent_span_id,
+                    }),
+                );
+            }
+
+            // Taint: the labels the request arrived with against the labels it
+            // leaves with. The difference is what this node added.
+            let input_labels: Vec<&String> = decisions.input_labels().iter().collect();
+            let final_labels: Vec<String> = ext
+                .security
+                .as_ref()
+                .map(|s| {
+                    let mut l: Vec<String> = s.labels.iter().cloned().collect();
+                    l.sort_unstable();
+                    l
+                })
+                .unwrap_or_default();
+            if !input_labels.is_empty() || !final_labels.is_empty() {
+                map.insert(
+                    "taint".into(),
+                    json!({ "input": input_labels, "final": final_labels }),
+                );
+            }
+
+            // Content: the hash at entry and this node's output hash, so a
+            // reader can tell whether a stage changed the payload. Gated on
+            // the input hash, which is absent unless an operator enabled
+            // provenance. Digests only, never content.
+            if let Some(input_hash) = decisions.input_hash() {
+                let output_hash = payload
+                    .and_then(PluginPayload::audit_bytes)
+                    .map(|b| praxis_policy_core::hooks::payload::content_hash(&b));
+                map.insert(
+                    "content".into(),
+                    json!({ "input_hash": input_hash, "output_hash": output_hash }),
+                );
+            }
         }
         record
     }
@@ -775,5 +821,89 @@ mod tests {
         let record = plugin.build_effect_record(&effect, &Extensions::default());
 
         assert_eq!(record["effect_state"], "prepared");
+    }
+
+    /// Provenance is what turns a pile of records into a graph: the span says
+    /// where this node sits, the taint says what it added, the hashes say
+    /// whether the content changed.
+    #[test]
+    fn a_decision_record_carries_span_and_taint() {
+        use praxis_policy_core::decision::Span;
+
+        let plugin = AuditLogger::new(sink_cfg()).unwrap();
+        let mut log = DecisionLog::new();
+        log.set_span(Span::for_request(Some("trace-abc"), Some("upstream")));
+        log.set_input_labels(vec!["PII".to_owned()]);
+        log.finalize(Verdict::Allow);
+
+        let mut security = SecurityExtension::default();
+        security.add_label("PII");
+        security.add_label("CONFIDENTIAL");
+        let ext = Extensions {
+            security: Some(Arc::new(security)),
+            ..Default::default()
+        };
+
+        let record = plugin.build_decision_record(Some(&empty_payload()), &ext, &log);
+
+        assert_eq!(record["span"]["trace_id"], "trace-abc");
+        assert_eq!(record["span"]["parent_span_id"], "upstream");
+        assert_ne!(
+            record["span"]["span_id"], "upstream",
+            "this node has its own span"
+        );
+        // The difference between the two is the taint this node added.
+        assert_eq!(record["taint"]["input"][0], "PII");
+        assert_eq!(record["taint"]["final"][0], "CONFIDENTIAL");
+        assert_eq!(record["taint"]["final"][1], "PII");
+    }
+
+    /// With provenance off there is no input hash, so the record carries no
+    /// content block at all rather than a half-populated one.
+    #[test]
+    fn no_input_hash_means_no_content_block() {
+        let plugin = AuditLogger::new(sink_cfg()).unwrap();
+        let mut log = DecisionLog::new();
+        log.finalize(Verdict::Allow);
+
+        let record =
+            plugin.build_decision_record(Some(&empty_payload()), &Extensions::default(), &log);
+
+        assert!(record.get("content").is_none());
+        assert!(record.get("taint").is_none(), "no labels either side");
+    }
+
+    /// Both hashes, so a reader can tell whether a stage changed the payload.
+    /// Only digests are recorded; the content itself never reaches the trail.
+    #[test]
+    fn an_input_hash_brings_the_output_hash_with_it() {
+        let plugin = AuditLogger::new(sink_cfg()).unwrap();
+        let mut log = DecisionLog::new();
+        log.set_input_hash(Some("sha256:aaa".to_owned()));
+        log.finalize(Verdict::Allow);
+
+        let record =
+            plugin.build_decision_record(Some(&empty_payload()), &Extensions::default(), &log);
+
+        assert_eq!(record["content"]["input_hash"], "sha256:aaa");
+        let output = record["content"]["output_hash"]
+            .as_str()
+            .expect("a CMF payload opts into hashing");
+        assert!(output.starts_with("sha256:"));
+    }
+
+    /// A sink fires for every hook family, so it can be handed a payload it
+    /// cannot hash. The record still says what it knows.
+    #[test]
+    fn a_payload_that_cannot_be_hashed_leaves_the_output_hash_null() {
+        let plugin = AuditLogger::new(sink_cfg()).unwrap();
+        let mut log = DecisionLog::new();
+        log.set_input_hash(Some("sha256:aaa".to_owned()));
+        log.finalize(Verdict::Allow);
+
+        let record = plugin.build_decision_record(None, &Extensions::default(), &log);
+
+        assert_eq!(record["content"]["input_hash"], "sha256:aaa");
+        assert!(record["content"]["output_hash"].is_null());
     }
 }

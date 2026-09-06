@@ -45,6 +45,10 @@ pub struct ExecutorConfig {
 
     /// Whether to halt on the first deny in concurrent mode.
     pub short_circuit_on_deny: bool,
+
+    /// Hash the payload at pipeline entry for audit content provenance.
+    /// Off by default, since hashing sits on the request path.
+    pub capture_content_provenance: bool,
 }
 
 impl Default for ExecutorConfig {
@@ -52,6 +56,7 @@ impl Default for ExecutorConfig {
         Self {
             timeout_seconds: 30,
             short_circuit_on_deny: true,
+            capture_content_provenance: false,
         }
     }
 }
@@ -372,6 +377,12 @@ impl Executor {
     /// A no-op when no sink is attached, so an unaudited host pays only a
     /// length check. The engine calls this at its zero-plugin short-circuits,
     /// which return before reaching `execute`.
+    ///
+    /// The record built here reaches the sinks but is not attached to the
+    /// `PipelineResult`, whose `decision_log` stays empty on this path. That
+    /// is deliberate: populating it would mean deriving a span, and so two
+    /// fresh UUIDs, on every invocation of every hook nothing is configured
+    /// for, which is the common case and the one that should cost nothing.
     pub(crate) async fn emit_empty_allow(
         &self,
         payload: &dyn PluginPayload,
@@ -381,8 +392,51 @@ impl Executor {
             return;
         }
         let mut decisions = DecisionLog::new();
+        self.capture_entry_provenance(&mut decisions, payload, extensions);
         decisions.finalize(Verdict::Allow);
         self.emit_audit(payload, extensions, &decisions).await;
+    }
+
+    /// Record what this invocation started from: its place in the trace, the
+    /// taint it arrived with, and optionally a hash of its content.
+    ///
+    /// The input side of a node's provenance has to be captured before any
+    /// plugin runs, because a sink comparing it against the final state is
+    /// what shows the pipeline's effect on the request.
+    ///
+    /// A no-op when no sink is attached, so provenance costs an unaudited host
+    /// nothing.
+    fn capture_entry_provenance(
+        &self,
+        decisions: &mut DecisionLog,
+        payload: &dyn PluginPayload,
+        extensions: &Extensions,
+    ) {
+        // Nothing will read it, so do not build it. Deriving a span means two
+        // fresh UUIDs and two allocations, which is not a price an unaudited
+        // host should pay on every request. The steps and the verdict are
+        // recorded either way, because the phases record them as they run.
+        if self.audit_handlers.is_empty() {
+            return;
+        }
+        let request = extensions.request.as_ref();
+        decisions.set_span(crate::decision::Span::for_request(
+            request.and_then(|r| r.trace_id.as_deref()),
+            request.and_then(|r| r.span_id.as_deref()),
+        ));
+        if let Some(sec) = extensions.security.as_ref() {
+            let mut labels: Vec<String> = sec.labels.iter().cloned().collect();
+            // Sorted so two records of the same labels compare equal.
+            labels.sort_unstable();
+            decisions.set_input_labels(labels);
+        }
+        if self.config.capture_content_provenance {
+            decisions.set_input_hash(
+                payload
+                    .audit_bytes()
+                    .map(|b| crate::hooks::payload::content_hash(&b)),
+            );
+        }
     }
 
     /// Hand the finalized decision to every audit sink, once per pipeline run.
@@ -488,6 +542,7 @@ impl Executor {
         // the phases, finalized at each return point, and attached to the
         // result for audit sinks.
         let mut decisions = DecisionLog::new();
+        self.capture_entry_provenance(&mut decisions, &*current_payload, &current_extensions);
 
         if let Some(v) = self
             .run_serial_phase(
@@ -1739,6 +1794,7 @@ mod tests {
         let executor = Executor::new(ExecutorConfig {
             timeout_seconds: 1,
             short_circuit_on_deny: true,
+            ..Default::default()
         });
         let entry = concurrent_entry("mock", on_error, failure);
         let tracker = tokio_util::task::TaskTracker::new();
@@ -1810,6 +1866,7 @@ mod tests {
         let executor = Executor::new(ExecutorConfig {
             timeout_seconds: 1,
             short_circuit_on_deny: true,
+            ..Default::default()
         });
         let entry = serial_entry("mock", OnError::Fail, Failure::WrongType);
         let tracker = tokio_util::task::TaskTracker::new();
@@ -1944,6 +2001,7 @@ mod tests {
         let executor = Executor::new(ExecutorConfig {
             timeout_seconds: 1,
             short_circuit_on_deny: true,
+            ..Default::default()
         });
         let entries = vec![
             concurrent_entry("lenient", OnError::Ignore, Failure::Error),
@@ -2135,6 +2193,7 @@ mod audit_seam_tests {
         let executor = Executor::new(ExecutorConfig {
             timeout_seconds: 5,
             short_circuit_on_deny: true,
+            ..Default::default()
         })
         .with_audit_handlers(sinks);
         let tracker = tokio_util::task::TaskTracker::new();
@@ -2423,6 +2482,7 @@ mod audit_seam_tests {
         let executor = Executor::new(ExecutorConfig {
             timeout_seconds: 5,
             short_circuit_on_deny: true,
+            ..Default::default()
         })
         .with_effect_log(log.clone());
         let tracker = tokio_util::task::TaskTracker::new();
@@ -2454,6 +2514,63 @@ mod audit_seam_tests {
         assert!(!refused);
         assert_eq!(seen.len(), 2, "intent then outcome");
         assert_eq!(seen[0].plugin_name.as_deref(), Some("minter"));
+    }
+
+    /// The phase rule is not part of auditing and does not switch off with it.
+    ///
+    /// An operator who wants no auditing installs no sink and configures no
+    /// log. That silences the records. It does not make it sound for a
+    /// concurrent branch to mint a credential the pipeline will discard, so
+    /// the refusal stands either way.
+    #[tokio::test]
+    async fn the_phase_rule_holds_with_auditing_switched_off() {
+        let acted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cfg = PluginConfig {
+            name: "minter".into(),
+            mode: PluginMode::Concurrent,
+            on_error: OnError::Ignore,
+            ..Default::default()
+        };
+        let entry = HookEntry {
+            plugin_ref: Arc::new(PluginRef::new(
+                Arc::new(EffectPlugin {
+                    cfg: cfg.clone(),
+                    acted: Arc::clone(&acted),
+                    refused: Arc::clone(&refused),
+                }),
+                cfg,
+            )),
+            handler: Arc::new(EffectPlugin {
+                cfg: PluginConfig::default(),
+                acted: Arc::clone(&acted),
+                refused: Arc::clone(&refused),
+            }),
+        };
+
+        // No sink, no effect log: auditing is entirely off.
+        let executor = Executor::new(ExecutorConfig {
+            timeout_seconds: 5,
+            ..Default::default()
+        });
+        let tracker = tokio_util::task::TaskTracker::new();
+        let payload: Box<dyn PluginPayload> = Box::new(P("in".into()));
+        let (_r, bg) = executor
+            .execute(
+                std::slice::from_ref(&entry),
+                payload,
+                Extensions::default(),
+                None,
+                &tracker,
+            )
+            .await;
+        bg.wait_for_background_tasks().await;
+
+        assert!(
+            !acted.load(std::sync::atomic::Ordering::SeqCst),
+            "the act must not run just because nobody is recording"
+        );
+        assert!(refused.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// A concurrent branch is cancelled when another branch short-circuits the
@@ -2544,5 +2661,160 @@ mod audit_seam_tests {
             1,
             "and the verdict still reaches the audit sinks"
         );
+    }
+
+    // =====================================================================
+    // Provenance captured at entry
+    // =====================================================================
+
+    /// Both are captured before any plugin runs, because a sink comparing
+    /// entry against exit is what shows the pipeline's effect. Capture them
+    /// afterwards and the two sides are identical and say nothing.
+    #[tokio::test]
+    async fn entry_provenance_records_the_span_and_the_taint_it_arrived_with() {
+        use crate::extensions::{RequestExtension, SecurityExtension};
+
+        let rec = Arc::new(Recorder::default());
+        let mut security = SecurityExtension::default();
+        security.add_label("PII");
+        let extensions = Extensions {
+            request: Some(Arc::new(RequestExtension {
+                trace_id: Some("trace-abc".to_owned()),
+                span_id: Some("upstream".to_owned()),
+                ..Default::default()
+            })),
+            security: Some(Arc::new(security)),
+            ..Default::default()
+        };
+
+        let executor = Executor::new(ExecutorConfig {
+            timeout_seconds: 5,
+            ..Default::default()
+        })
+        .with_audit_handlers(vec![rec.clone()]);
+        let tracker = tokio_util::task::TaskTracker::new();
+        let payload: Box<dyn PluginPayload> = Box::new(P("in".into()));
+        let entries = [entry("a", PluginMode::Sequential, Act::Allow)];
+        let (result, _bg) = executor
+            .execute(&entries, payload, extensions, None, &tracker)
+            .await;
+
+        let log = result.decision_log;
+        let span = log.span().expect("the executor stamps a span");
+        assert_eq!(span.trace_id, "trace-abc");
+        assert_eq!(span.parent_span_id.as_deref(), Some("upstream"));
+        assert_eq!(log.input_labels(), ["PII"]);
+        assert_eq!(rec.calls().len(), 1);
+    }
+
+    /// An unaudited host builds no provenance at all. Deriving a span costs
+    /// two fresh UUIDs and two allocations per request, which nobody should
+    /// pay for a record no sink will read.
+    #[tokio::test]
+    async fn with_no_sink_no_provenance_is_built() {
+        use crate::extensions::{RequestExtension, SecurityExtension};
+
+        let mut security = SecurityExtension::default();
+        security.add_label("PII");
+        let extensions = Extensions {
+            request: Some(Arc::new(RequestExtension {
+                trace_id: Some("trace-abc".to_owned()),
+                ..Default::default()
+            })),
+            security: Some(Arc::new(security)),
+            ..Default::default()
+        };
+
+        let executor = Executor::new(ExecutorConfig {
+            timeout_seconds: 5,
+            capture_content_provenance: true,
+            ..Default::default()
+        });
+        let entries = [entry("a", PluginMode::Sequential, Act::Allow)];
+        let tracker = tokio_util::task::TaskTracker::new();
+        let payload: Box<dyn PluginPayload> = Box::new(P("in".into()));
+        let (result, _bg) = executor
+            .execute(&entries, payload, extensions, None, &tracker)
+            .await;
+
+        let log = result.decision_log;
+        assert!(log.span().is_none(), "no span is derived");
+        assert!(log.input_labels().is_empty(), "no taint is captured");
+        assert!(log.input_hash().is_none(), "and nothing is hashed");
+        // What the phases record as they run is still there, because it costs
+        // nothing extra.
+        assert_eq!(log.steps().len(), 1);
+        assert!(log.verdict().is_some());
+    }
+
+    /// Hashing sits on the request path, so an operator who did not ask for it
+    /// pays nothing and the record carries no content reference at all.
+    #[tokio::test]
+    async fn content_is_not_hashed_unless_it_was_asked_for() {
+        // A sink is attached, so provenance is built. What this asserts is
+        // that the content knob alone decides whether a hash is part of it.
+        let executor = Executor::new(ExecutorConfig {
+            timeout_seconds: 5,
+            ..Default::default()
+        })
+        .with_audit_handlers(vec![Arc::new(Recorder::default())]);
+        let tracker = tokio_util::task::TaskTracker::new();
+        let payload: Box<dyn PluginPayload> = Box::new(P("in".into()));
+        let entries = [entry("a", PluginMode::Sequential, Act::Allow)];
+        let (result, _bg) = executor
+            .execute(&entries, payload, Extensions::default(), None, &tracker)
+            .await;
+
+        assert!(result.decision_log.input_hash().is_none());
+        assert!(
+            result.decision_log.span().is_some(),
+            "the rest of the provenance was still built, so this is the knob"
+        );
+    }
+
+    /// The payload here does not opt into hashing, so even with provenance on
+    /// there is nothing to hash. Enabling the knob must not invent a digest.
+    #[tokio::test]
+    async fn a_payload_that_cannot_be_hashed_records_no_digest() {
+        let executor = Executor::new(ExecutorConfig {
+            timeout_seconds: 5,
+            capture_content_provenance: true,
+            ..Default::default()
+        })
+        .with_audit_handlers(vec![Arc::new(Recorder::default())]);
+        let tracker = tokio_util::task::TaskTracker::new();
+        let payload: Box<dyn PluginPayload> = Box::new(P("in".into()));
+        let entries = [entry("a", PluginMode::Sequential, Act::Allow)];
+        let (result, _bg) = executor
+            .execute(&entries, payload, Extensions::default(), None, &tracker)
+            .await;
+
+        assert!(result.decision_log.input_hash().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_opted_in_payload_is_hashed_when_provenance_is_on() {
+        use crate::cmf::{Message, MessagePayload, Role};
+
+        let executor = Executor::new(ExecutorConfig {
+            timeout_seconds: 5,
+            capture_content_provenance: true,
+            ..Default::default()
+        })
+        .with_audit_handlers(vec![Arc::new(Recorder::default())]);
+        let tracker = tokio_util::task::TaskTracker::new();
+        let payload: Box<dyn PluginPayload> = Box::new(MessagePayload {
+            message: Message::with_content(Role::User, Vec::new()),
+        });
+        let entries = [entry("a", PluginMode::Sequential, Act::Allow)];
+        let (result, _bg) = executor
+            .execute(&entries, payload, Extensions::default(), None, &tracker)
+            .await;
+
+        let hash = result
+            .decision_log
+            .input_hash()
+            .expect("an opted-in payload is hashed");
+        assert!(hash.starts_with("sha256:"), "got {hash}");
     }
 }

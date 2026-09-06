@@ -90,6 +90,60 @@ impl Verdict {
     }
 }
 
+/// The W3C trace context for one pipeline invocation: this interception's
+/// identity in the decision graph.
+///
+/// `span_id` is this interception's own span, `parent_span_id` is the upstream
+/// call that caused it, and `trace_id` correlates the whole run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Span {
+    /// The trace this invocation belongs to (W3C trace-id, 32 hex chars).
+    pub trace_id: String,
+    /// This interception's own span (W3C span-id, 16 hex chars).
+    pub span_id: String,
+    /// The span of the upstream call that caused this one, and so the causal
+    /// edge. `None` when the request carried no trace context, making this a
+    /// trace root.
+    pub parent_span_id: Option<String>,
+}
+
+impl Span {
+    /// Derive an interception's span from the request's trace context.
+    ///
+    /// A child-span model: a fresh `span_id` for this interception, the
+    /// request's `span_id` as the causal parent, and the request's `trace_id`
+    /// carried through, or a freshly originated one when the request carries
+    /// none.
+    #[must_use]
+    pub fn for_request(trace_id: Option<&str>, parent_span_id: Option<&str>) -> Self {
+        Self {
+            trace_id: trace_id.map_or_else(new_trace_id, str::to_owned),
+            span_id: new_span_id(),
+            parent_span_id: parent_span_id.map(str::to_owned),
+        }
+    }
+}
+
+/// A freshly originated W3C trace-id: 16 bytes as 32 lowercase hex chars.
+fn new_trace_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// A freshly originated W3C span-id: 8 bytes as 16 lowercase hex chars, the
+/// first half of a UUID's hex.
+fn new_span_id() -> String {
+    // The first 8 of a UUID's 16 bytes, hex-encoded. Taking bytes rather than
+    // slicing the hex string keeps this free of any assumption about where a
+    // character boundary falls.
+    let bytes = uuid::Uuid::new_v4().into_bytes();
+    let mut s = String::with_capacity(16);
+    for b in &bytes[..8] {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 /// The executor's record of one pipeline invocation: the ordered steps the
 /// plugins took and the terminal verdict.
 ///
@@ -99,6 +153,9 @@ impl Verdict {
 pub struct DecisionLog {
     steps: Vec<DecisionStep>,
     verdict: Option<Verdict>,
+    span: Option<Span>,
+    input_labels: Vec<String>,
+    input_hash: Option<String>,
 }
 
 impl DecisionLog {
@@ -126,6 +183,40 @@ impl DecisionLog {
     /// before the log reaches any audit handler.
     pub fn finalize(&mut self, verdict: Verdict) {
         self.verdict = Some(verdict);
+    }
+
+    /// Attach this invocation's trace context, set by the executor at pipeline
+    /// entry from the request.
+    pub fn set_span(&mut self, span: Span) {
+        self.span = Some(span);
+    }
+
+    /// This invocation's trace context, if the executor set one.
+    pub fn span(&self) -> Option<&Span> {
+        self.span.as_ref()
+    }
+
+    /// Record the taint labels the request arrived with, the input side of
+    /// this node's provenance. Diffed against the final labels, it gives the
+    /// taint the pipeline added.
+    pub fn set_input_labels(&mut self, labels: Vec<String>) {
+        self.input_labels = labels;
+    }
+
+    /// The taint labels present at pipeline entry.
+    pub fn input_labels(&self) -> &[String] {
+        &self.input_labels
+    }
+
+    /// Record the content hash of the payload at entry. Set only when content
+    /// provenance is enabled, since hashing sits on the request path.
+    pub fn set_input_hash(&mut self, hash: Option<String>) {
+        self.input_hash = hash;
+    }
+
+    /// The content hash of the payload at entry, if it was captured.
+    pub fn input_hash(&self) -> Option<&str> {
+        self.input_hash.as_deref()
     }
 
     /// The ordered steps taken this invocation.
@@ -222,5 +313,57 @@ mod tests {
             other => panic!("expected DenyIgnored, got {other:?}"),
         }
         assert_ne!(PluginAction::Aborted, PluginAction::Error(String::new()));
+    }
+
+    /// A request carrying trace context becomes a child of the call that
+    /// caused it, not a new root. Losing that edge breaks the only link
+    /// between an interception and the request it was intercepting.
+    #[test]
+    fn a_request_with_trace_context_produces_a_child_span() {
+        let span = Span::for_request(Some("trace-abc"), Some("upstream-span"));
+
+        assert_eq!(span.trace_id, "trace-abc", "the trace carries through");
+        assert_eq!(span.parent_span_id.as_deref(), Some("upstream-span"));
+        assert_ne!(
+            span.span_id, "upstream-span",
+            "this interception gets its own span, not the parent's"
+        );
+        assert_eq!(span.span_id.len(), 16, "a W3C span-id is 16 hex chars");
+    }
+
+    /// Nothing upstream sent trace context, so this interception starts a
+    /// trace rather than being dropped from the graph.
+    #[test]
+    fn a_request_with_no_trace_context_starts_a_root() {
+        let span = Span::for_request(None, None);
+
+        assert!(span.parent_span_id.is_none(), "a root has no causal parent");
+        assert_eq!(span.trace_id.len(), 32, "a W3C trace-id is 32 hex chars");
+        assert_ne!(
+            Span::for_request(None, None).trace_id,
+            span.trace_id,
+            "each root is its own trace"
+        );
+    }
+
+    #[test]
+    fn provenance_is_absent_until_the_executor_captures_it() {
+        let log = DecisionLog::new();
+
+        assert!(log.span().is_none());
+        assert!(log.input_labels().is_empty());
+        assert!(log.input_hash().is_none());
+    }
+
+    #[test]
+    fn captured_provenance_reads_back() {
+        let mut log = DecisionLog::new();
+        log.set_span(Span::for_request(Some("t"), None));
+        log.set_input_labels(vec!["PII".to_owned()]);
+        log.set_input_hash(Some("sha256:abc".to_owned()));
+
+        assert_eq!(log.span().map(|s| s.trace_id.as_str()), Some("t"));
+        assert_eq!(log.input_labels(), ["PII"]);
+        assert_eq!(log.input_hash(), Some("sha256:abc"));
     }
 }

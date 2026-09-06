@@ -188,6 +188,18 @@ pub struct EngineSettings {
     /// built-in default.
     #[serde(default)]
     pub effect_log_compaction_threshold: Option<usize>,
+
+    /// Record a content hash of the payload for audit provenance.
+    ///
+    /// The executor hashes the payload at pipeline entry and an audit sink
+    /// hashes the output, so a reader can tell whether a stage changed the
+    /// content without the trail holding either version. Only the digest is
+    /// kept, never the bytes.
+    ///
+    /// Off by default: hashing sits on the request path, so it is a cost an
+    /// operator opts into.
+    #[serde(default)]
+    pub capture_content_provenance: bool,
 }
 
 impl Default for EngineSettings {
@@ -199,6 +211,7 @@ impl Default for EngineSettings {
             route_cache_max_entries: default_route_cache_max_entries(),
             effect_log_path: None,
             effect_log_compaction_threshold: None,
+            capture_content_provenance: false,
         }
     }
 }
@@ -9151,5 +9164,36 @@ routes:
     fn a_config_with_no_flag_above_a_route_reports_nothing() {
         let config = load(FOUR_LEVELS);
         assert!(dropped_inherited_assertions(&config).is_empty());
+    }
+    /// The configuration in `docs/auditing.md` has to load. A doc whose
+    /// examples do not parse is worse than no doc: it sends an operator
+    /// debugging their YAML instead of their policy.
+    #[test]
+    fn the_documented_auditing_config_loads() {
+        let yaml = "
+engine_settings:
+  effect_log_path: /var/lib/praxis/effects.ndjson
+  effect_log_compaction_threshold: 1024
+  capture_content_provenance: true
+plugins:
+  - name: audit
+    kind: audit/logger
+    mode: audit
+    config:
+      destination: stderr
+      source: gateway-eu-1
+";
+        let config: PolicyConfig =
+            serde_yaml::from_str(yaml).expect("the documented config must parse");
+        assert_eq!(
+            config.engine_settings.effect_log_path.as_deref(),
+            Some("/var/lib/praxis/effects.ndjson")
+        );
+        assert_eq!(
+            config.engine_settings.effect_log_compaction_threshold,
+            Some(1024)
+        );
+        assert!(config.engine_settings.capture_content_provenance);
+        assert_eq!(config.plugins[0].kind, "audit/logger");
     }
 }

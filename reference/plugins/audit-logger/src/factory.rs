@@ -136,4 +136,34 @@ mod tests {
             "and attaches as a decision sink instead"
         );
     }
+
+    /// The sink-mode config in `docs/auditing.md`, built through the factory
+    /// the way the engine would. A documented example that does not construct
+    /// is a bug report waiting to be filed.
+    #[test]
+    fn the_documented_sink_config_builds_a_sink() {
+        let config = PluginConfig {
+            name: "audit".into(),
+            kind: KIND.into(),
+            hooks: Vec::new(),
+            mode: PluginMode::Audit,
+            config: Some(serde_json::json!({
+                "destination": "stderr",
+                "source": "gateway-eu-1",
+            })),
+            ..Default::default()
+        };
+
+        let Ok(inst) = AuditLoggerFactory.create(&config) else {
+            panic!("the documented sink config must build");
+        };
+        assert!(
+            inst.handlers.is_empty(),
+            "sink mode registers no hook handlers"
+        );
+        assert!(
+            inst.plugin.clone().as_audit_handler().is_some(),
+            "and attaches as a decision sink"
+        );
+    }
 }

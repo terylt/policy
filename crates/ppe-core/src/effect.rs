@@ -240,6 +240,13 @@ impl DurableEffectLog for FileEffectLog {
             let _guard = self.write_lock.lock().await;
             tokio::task::spawn_blocking(move || -> Result<(), Box<PluginError>> {
                 use std::io::Write as _;
+                // Whether this call is what brings the file into existence.
+                // `fsync` on a file does not make its directory entry durable,
+                // so without the extra sync below a crash right after the
+                // first append can leave no file at all, and the intent this
+                // call promised to record would be gone while the act it
+                // guarded had already happened.
+                let creating = !path.exists();
                 let mut file = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -251,6 +258,9 @@ impl DurableEffectLog for FileEffectLog {
                 // before this returns, and therefore before the caller acts.
                 file.sync_all()
                     .map_err(|e| wal_error("fsync the log", Some(Box::new(e))))?;
+                if creating {
+                    sync_parent_dir(path.as_ref())?;
+                }
                 Ok(())
             })
             .await
@@ -300,6 +310,22 @@ impl DurableEffectLog for FileEffectLog {
         }
         Ok(still_unknown)
     }
+}
+
+/// `fsync` the directory holding `path`, making a file creation or a rename in
+/// it durable.
+///
+/// A file's own `fsync` covers its contents, not the directory entry that
+/// names it. Both callers here change what the directory holds.
+fn sync_parent_dir(path: &std::path::Path) -> Result<(), Box<PluginError>> {
+    // A bare filename has an empty parent, which is the current directory.
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    };
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| wal_error("fsync the log's directory", Some(Box::new(e))))
 }
 
 /// The error a durable-write failure surfaces. `begin_effect` treats any error
@@ -419,6 +445,12 @@ impl FileEffectLog {
             }
             std::fs::rename(&tmp, path.as_ref())
                 .map_err(|e| wal_error("rename the temp log", Some(Box::new(e))))?;
+            // A rename is atomic but not automatically durable. Without this,
+            // a crash can undo the compaction and bring the old file back.
+            // That is safe, because recovery is idempotent and would simply
+            // sweep it again, but it also leaves the temp file behind and the
+            // compaction silently not applied.
+            sync_parent_dir(path.as_ref())?;
 
             Ok(RecoverySummary {
                 compacted,
@@ -969,6 +1001,39 @@ mod tests {
         // The second append crosses the threshold and compacts the completed
         // pair away. The append itself still reports success.
         assert!(lines(&path).is_empty());
+    }
+
+    /// `fsync` on a file covers its contents, not the directory entry naming
+    /// it. The first append is the one that creates the entry, so without a
+    /// directory sync a crash there loses the file entirely, taking with it
+    /// the intent that had already licensed the act.
+    #[tokio::test]
+    async fn the_first_append_into_a_new_directory_survives() {
+        let dir = std::env::temp_dir().join(format!("ppe_newdir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("effects.ndjson");
+        let log = FileEffectLog::new(&path);
+
+        log.append(&EffectRecord::prepared("token_mint", "d", "k-1"))
+            .await
+            .unwrap();
+
+        assert_eq!(lines(&path).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A bare filename has an empty parent, which is not a directory that can
+    /// be opened. It has to resolve to the current directory instead.
+    #[test]
+    fn a_bare_filename_syncs_the_current_directory() {
+        sync_parent_dir(std::path::Path::new("Cargo.toml"))
+            .expect("a path with no directory component must still sync");
+    }
+
+    #[test]
+    fn a_path_with_a_directory_syncs_that_directory() {
+        sync_parent_dir(&wal_path("dirsync")).expect("a real directory syncs");
     }
 
     #[tokio::test]

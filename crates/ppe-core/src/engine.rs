@@ -855,6 +855,7 @@ fn snapshot_from_config(
     let mut executor = Executor::new(ExecutorConfig {
         timeout_seconds: policy_config.engine_settings.plugin_timeout,
         short_circuit_on_deny: policy_config.engine_settings.short_circuit_on_deny,
+        capture_content_provenance: policy_config.engine_settings.capture_content_provenance,
     })
     .with_audit_handlers(registry.audit_handlers());
 
@@ -5005,6 +5006,7 @@ plugins:
             executor: crate::executor::ExecutorConfig {
                 timeout_seconds: 30,
                 short_circuit_on_deny: false,
+                ..Default::default()
             },
             route_cache_max_entries: DEFAULT_ROUTE_CACHE_MAX_ENTRIES,
         };
@@ -5176,6 +5178,7 @@ plugins:
             executor: crate::executor::ExecutorConfig {
                 timeout_seconds: 1,
                 short_circuit_on_deny: true,
+                ..Default::default()
             },
             route_cache_max_entries: DEFAULT_ROUTE_CACHE_MAX_ENTRIES,
         };
