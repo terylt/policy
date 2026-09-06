@@ -523,7 +523,12 @@ enum EffectLogState {
         plugin_name: Arc<str>,
     },
     /// Effects may not be performed from this phase.
-    NotPermitted(crate::plugin::PluginMode),
+    NotPermitted {
+        mode: crate::plugin::PluginMode,
+        /// Named in the error, so an operator is told which plugin to move
+        /// rather than being pointed at the framework.
+        plugin_name: Arc<str>,
+    },
 }
 
 impl EffectLogSlot {
@@ -544,8 +549,11 @@ impl EffectLogSlot {
 
     /// Effects refused, because this phase cannot perform them soundly.
     #[must_use]
-    pub fn not_permitted(mode: crate::plugin::PluginMode) -> Self {
-        Self(EffectLogState::NotPermitted(mode))
+    pub fn not_permitted(mode: crate::plugin::PluginMode, plugin_name: &str) -> Self {
+        Self(EffectLogState::NotPermitted {
+            mode,
+            plugin_name: Arc::from(plugin_name),
+        })
     }
 
     /// Whether an effect performed here would be recorded anywhere.
@@ -575,11 +583,14 @@ fn detached_error() -> Box<PluginError> {
 /// The error a plugin gets for performing an effect from a phase that cannot
 /// support one. It names the fix, because the alternative is a mint that runs
 /// with no record and no complaint.
-fn phase_error(mode: crate::plugin::PluginMode) -> Box<PluginError> {
+fn phase_error(mode: crate::plugin::PluginMode, plugin_name: &str) -> Box<PluginError> {
     PluginError::Execution {
-        plugin_name: "effect".into(),
+        plugin_name: plugin_name.to_owned(),
         message: format!(
-            "a plugin in {mode:?} mode cannot perform an irreversible effect: work in this              phase is cancelled or discarded when the pipeline short-circuits, and an              external act cannot be taken back. Move the plugin to sequential or transform              mode, where it runs to completion and its result is honored."
+            "cannot perform an irreversible effect from {mode:?} mode. Work in this phase is \
+             cancelled or discarded when the pipeline short-circuits, and an external act \
+             cannot be taken back, so set this plugin's `mode:` to sequential or transform, \
+             where it runs to completion and its result is honored."
         ),
         source: None,
         code: Some("effect_phase_not_permitted".into()),
@@ -682,7 +693,9 @@ impl crate::hooks::payload::Extensions {
         let (sink, plugin_name) = match &self.effect_log.0 {
             EffectLogState::Unrecorded => return Ok(()),
             EffectLogState::Detached => return Err(detached_error()),
-            EffectLogState::NotPermitted(mode) => return Err(phase_error(*mode)),
+            EffectLogState::NotPermitted { mode, plugin_name } => {
+                return Err(phase_error(*mode, plugin_name));
+            },
             EffectLogState::Recorded { sink, plugin_name } => (sink, plugin_name),
         };
 
@@ -1112,6 +1125,7 @@ mod tests {
     async fn a_phase_that_cannot_support_effects_refuses_them() {
         let ext = ext_with(EffectLogSlot::not_permitted(
             crate::plugin::PluginMode::Concurrent,
+            "minter",
         ));
         let effect = EffectRecord::prepared("token_mint", "d", "k-1");
         let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1157,6 +1171,7 @@ mod tests {
                 "a refused phase",
                 ext_with(EffectLogSlot::not_permitted(
                     crate::plugin::PluginMode::Concurrent,
+                    "minter",
                 )),
             ),
             (

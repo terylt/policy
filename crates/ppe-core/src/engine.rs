@@ -951,6 +951,18 @@ impl PolicyEngine {
         }
     }
 
+    /// Install the durable log that irreversible effects are recorded to,
+    /// for a host that wires its plugins programmatically rather than from
+    /// config.
+    ///
+    /// The config path (`engine_settings.effect_log_path`) is the usual one.
+    /// This does not survive `load_config`, which rebuilds the executor from
+    /// the config it is given, so a log that must outlive a reload belongs in
+    /// config. Call before [`Self::initialize`] so startup recovery sees it.
+    pub fn set_effect_log(&self, effect_log: Arc<dyn crate::effect::DurableEffectLog>) {
+        self.mutate_runtime(|snap| snap.executor.set_effect_log(effect_log));
+    }
+
     /// Reconcile any effects a previous run left mid-flight, using the
     /// default reconciler ([`crate::effect::LogUnknownsReconciler`]).
     ///

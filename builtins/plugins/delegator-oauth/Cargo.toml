@@ -41,6 +41,8 @@ categories.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# A unique key per mint attempt, so recovery can tell attempts apart.
+uuid = { workspace = true }
 praxis-policy-core = { workspace = true }
 
 async-trait = { workspace = true }

@@ -264,7 +264,7 @@ pub(crate) async fn run_request(
 /// outlives a capability an operator has since revoked.
 ///
 /// Deliberately not `Clone`. Hiding the `Arc` behind the newtype is not enough
-/// on its own: with the field public, a clonable slot could be copied out of
+/// on its own: with the field public, a cloneable slot could be copied out of
 /// the `&Extensions` a plugin is lent, stashed, and later used on a
 /// hand-built `Extensions`. The capability check would then read the verdict
 /// frozen into that copy rather than the plugin's current grant, so a

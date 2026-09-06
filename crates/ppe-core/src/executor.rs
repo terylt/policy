@@ -323,6 +323,12 @@ impl Executor {
         self
     }
 
+    /// Install the durable effect log through a snapshot mutation, the
+    /// engine's programmatic path. Mirrors [`Self::set_audit_handlers`].
+    pub fn set_effect_log(&mut self, effect_log: Arc<dyn DurableEffectLog>) {
+        self.rebuild_effect_sink(Some(effect_log));
+    }
+
     /// The installed effect log, for the engine to run recovery at startup.
     pub fn effect_log(&self) -> Option<Arc<dyn DurableEffectLog>> {
         self.effect_sink.as_ref().and_then(|s| s.log())
@@ -655,7 +661,7 @@ impl Executor {
             // when something would record the effect; otherwise the default
             // already permits it and records nothing.
             filtered.effect_log = if !phase.permits_effects() {
-                EffectLogSlot::not_permitted(phase)
+                EffectLogSlot::not_permitted(phase, plugin_name)
             } else if let Some(sink) = &self.effect_sink {
                 EffectLogSlot::recorded(Arc::clone(sink), plugin_name)
             } else {
@@ -1011,8 +1017,10 @@ impl Executor {
             let mut filtered = filter_extensions(extensions, &capabilities);
             // Refused here: this phase's work is cancelled or discarded
             // when the pipeline short-circuits, and an external act is not.
-            filtered.effect_log =
-                EffectLogSlot::not_permitted(entry.plugin_ref.trusted_config().mode);
+            filtered.effect_log = EffectLogSlot::not_permitted(
+                entry.plugin_ref.trusted_config().mode,
+                entry.plugin_ref.name(),
+            );
             let timeout_dur = Duration::from_secs(self.config.timeout_seconds);
 
             let result = timeout(
@@ -1148,7 +1156,10 @@ impl Executor {
                 let mut f = filter_extensions(extensions, &capabilities);
                 // Refused here: this phase's work is cancelled or discarded
                 // when the pipeline short-circuits, and an external act is not.
-                f.effect_log = EffectLogSlot::not_permitted(entry.plugin_ref.trusted_config().mode);
+                f.effect_log = EffectLogSlot::not_permitted(
+                    entry.plugin_ref.trusted_config().mode,
+                    entry.plugin_ref.name(),
+                );
                 f
             });
 
@@ -1413,7 +1424,10 @@ impl Executor {
                 let mut f = filter_extensions(extensions, &capabilities);
                 // Refused here: this phase's work is cancelled or discarded
                 // when the pipeline short-circuits, and an external act is not.
-                f.effect_log = EffectLogSlot::not_permitted(entry.plugin_ref.trusted_config().mode);
+                f.effect_log = EffectLogSlot::not_permitted(
+                    entry.plugin_ref.trusted_config().mode,
+                    entry.plugin_ref.name(),
+                );
                 f
             });
 
