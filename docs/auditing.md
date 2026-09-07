@@ -118,6 +118,29 @@ Only payloads that opt in are hashed, which today means the CMF
 `MessagePayload`. Anything else records no digest rather than a misleading one.
 It is off by default because hashing sits on the request path.
 
+One collector may gather records from several processes. Naming the stream
+keeps them countable apart:
+
+```yaml
+engine_settings:
+  audit_stream_namespace: gw-1
+```
+
+Stream ids become `gw-1:decision` and `gw-1:effect`. An empty or whitespace
+value is refused at load, since it would compose `:decision`, which is neither
+a bare label nor an attributable one.
+
+The epoch has no YAML key on purpose. It defaults to the executor's boot time,
+which advances on its own and is correct with no configuration. A host that
+needs to set it does so in code, and takes on the invariant: the value has to
+be strictly larger on every load, reloads included, because a reload builds a
+fresh executor with the counters back at zero. Repeat an epoch and this
+generation's records collide with the last one's, and a reader can no longer
+tell a restart from records that went missing. A file cannot satisfy that,
+which is why the key does not exist. PPE warns when the epoch fails to advance
+across a reload, but still loads: the records are worth having even when the
+completeness claim is compromised.
+
 ## The records
 
 A decision:
@@ -170,6 +193,26 @@ the end is exactly what this node added.
 
 `content` appears only with provenance enabled, holding `input_hash` and
 `output_hash`.
+
+`epoch`, `stream_id`, `stream_seq` and `emission_seq` place the record in the
+audit stream, and they answer two different questions.
+
+`stream_seq` counts records within one stream and never skips, so a reader who
+sees 4 then 6 knows record 5 was lost rather than never written. That is the
+claim a tamper-evident consumer needs, and it only holds within one `epoch`:
+the counters restart with each executor, and `epoch` is the process generation,
+so a smaller sequence under a larger epoch is a restart rather than a gap.
+
+`emission_seq` is shared between decisions and effects. It says only what order
+things happened in, so that a reader merging both streams can put them back in
+sequence. Reading one stream on its own it looks full of holes, and those holes
+are the other stream's records, not losses. Use `stream_seq` to check for loss
+and `emission_seq` to order, never the reverse.
+
+`stream_id` is the stream a record belongs to, `decision` or `effect`, prefixed
+by the namespace when one is configured. The type suffix always survives, so a
+consumer recovering it splits on the last colon rather than the first, since a
+namespace may contain one.
 
 An effect is its own event:
 

@@ -215,6 +215,12 @@ impl AuditLogger {
         if !effect.details.is_empty() {
             record.insert("effect_details".into(), json!(effect.details));
         }
+        if let Some(stream_seq) = effect.stream_seq {
+            record.insert("epoch".into(), json!(effect.epoch));
+            record.insert("stream_id".into(), json!(effect.stream_id));
+            record.insert("stream_seq".into(), json!(stream_seq));
+            record.insert("emission_seq".into(), json!(effect.emission_seq));
+        }
         Value::Object(record)
     }
 
@@ -301,6 +307,17 @@ impl AuditLogger {
             // reader can tell whether a stage changed the payload. Gated on
             // the input hash, which is absent unless an operator enabled
             // provenance. Digests only, never content.
+            // Stream identity and the two counters. `stream_seq` is gap-free
+            // within its stream, so a consumer can prove nothing was dropped;
+            // `emission_seq` is shared with the effect stream, so the two can
+            // be merged back into the order they happened.
+            if let Some(stream_seq) = decisions.stream_seq() {
+                map.insert("epoch".into(), json!(decisions.epoch()));
+                map.insert("stream_id".into(), json!(decisions.stream_id()));
+                map.insert("stream_seq".into(), json!(stream_seq));
+                map.insert("emission_seq".into(), json!(decisions.emission_seq()));
+            }
+
             if let Some(input_hash) = decisions.input_hash() {
                 let output_hash = payload
                     .and_then(PluginPayload::audit_bytes)

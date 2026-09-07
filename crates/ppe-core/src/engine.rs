@@ -856,6 +856,8 @@ fn snapshot_from_config(
         timeout_seconds: policy_config.engine_settings.plugin_timeout,
         short_circuit_on_deny: policy_config.engine_settings.short_circuit_on_deny,
         capture_content_provenance: policy_config.engine_settings.capture_content_provenance,
+        audit_stream_namespace: policy_config.engine_settings.audit_stream_namespace.clone(),
+        audit_epoch: policy_config.engine_settings.audit_epoch,
     })
     .with_audit_handlers(registry.audit_handlers());
 
@@ -888,6 +890,26 @@ fn snapshot_from_config(
             built
         };
         executor = executor.with_effect_log(log);
+    }
+
+    // A reload builds a fresh executor with the stream counters back at zero,
+    // so its epoch has to be strictly larger than the previous generation's.
+    // Otherwise the new `(epoch, seq)` pairs collide with records already
+    // emitted and a consumer can no longer tell a restart from records that
+    // went missing. Boot time always advances; only a pinned `audit_epoch`
+    // override can regress, and that is the host's invariant to keep. Warn
+    // rather than refuse: the records still emit, and only a consumer
+    // asserting completeness would notice.
+    if let Some(prev) = prev {
+        let (was, now) = (prev.executor.epoch(), executor.epoch());
+        if now <= was {
+            warn!(
+                "the audit epoch did not increase across a reload ({was} then {now}); the \
+                 stream counters restart with each executor, so records from this \
+                 generation will collide with the last one's. A programmatic \
+                 `audit_epoch` override has to supply a larger value on every load."
+            );
+        }
     }
     let route_cache_max_entries = policy_config.engine_settings.route_cache_max_entries;
     let http_routes_declaring_authentication = http_routes_declaring_authentication(&policy_config);

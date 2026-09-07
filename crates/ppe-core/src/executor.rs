@@ -22,6 +22,7 @@
 use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::time::timeout;
@@ -30,7 +31,7 @@ use tracing::{error, warn};
 use crate::audit::AuditHandler;
 use crate::context::PluginContextTable;
 use crate::decision::{DecisionLog, PluginAction, Verdict};
-use crate::effect::{DurableEffectLog, EffectLogSlot, EffectSink};
+use crate::effect::{DurableEffectLog, EffectLogSlot, EffectSink, EffectStream};
 use crate::error::PluginError;
 use crate::extensions::filter_extensions;
 use crate::hooks::payload::{Extensions, PluginPayload, WriteToken};
@@ -49,6 +50,25 @@ pub struct ExecutorConfig {
     /// Hash the payload at pipeline entry for audit content provenance.
     /// Off by default, since hashing sits on the request path.
     pub capture_content_provenance: bool,
+
+    /// Prefix for the audit stream ids, so records from one process are
+    /// attributable to it. `Some("gw-1")` gives `"gw-1:decision"` and
+    /// `"gw-1:effect"`; `None` leaves the bare labels.
+    ///
+    /// The type suffix always survives, so each stream stays independently
+    /// gap-free and its completeness claim holds. A consumer recovering the
+    /// type must split on the last colon, since a namespace may contain one.
+    pub audit_stream_namespace: Option<String>,
+
+    /// Override the audit epoch, the executor's generation identifier.
+    ///
+    /// `None` uses boot time, which advances on its own and is correct with no
+    /// configuration. A host that overrides it owns the invariant that the
+    /// value strictly increases on every load, including reloads: the stream
+    /// counters restart with each executor, so a repeated epoch collides with
+    /// the previous generation's records and a verifier can no longer tell a
+    /// reset from a loss.
+    pub audit_epoch: Option<u64>,
 }
 
 impl Default for ExecutorConfig {
@@ -57,6 +77,8 @@ impl Default for ExecutorConfig {
             timeout_seconds: 30,
             short_circuit_on_deny: true,
             capture_content_provenance: false,
+            audit_stream_namespace: None,
+            audit_epoch: None,
         }
     }
 }
@@ -306,16 +328,71 @@ pub struct Executor {
     /// configured neither a log nor a sink, in which case a plugin's effects
     /// run unrecorded and the slot costs no allocation per invocation.
     effect_sink: Option<Arc<EffectSink>>,
+
+    /// Audit stream identity. `epoch` scopes the counters so a restart is
+    /// distinguishable from records going missing. The counters are `Arc` so a
+    /// copy-on-write snapshot mutation keeps writing to the same stream rather
+    /// than restarting it.
+    epoch: u64,
+    decision_seq: Arc<AtomicU64>,
+    effect_seq: Arc<AtomicU64>,
+    emission_seq: Arc<AtomicU64>,
+    stream_namespace: Option<String>,
+}
+
+/// Compose a stream id from an optional namespace and the per-type label.
+fn compose_stream_id(namespace: Option<&str>, kind: &str) -> String {
+    match namespace {
+        Some(ns) => format!("{ns}:{kind}"),
+        None => kind.to_owned(),
+    }
 }
 
 impl Executor {
     /// Create a new executor with the given configuration.
     pub fn new(config: ExecutorConfig) -> Self {
+        // Boot time in Unix nanoseconds unless a host supplies one. It needs
+        // no persistence and a new executor always gets a larger value, which
+        // is what lets a verifier tell a counter reset from a loss.
+        let epoch = config.audit_epoch.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+        });
+        let stream_namespace = config.audit_stream_namespace.clone();
         Self {
             config,
             audit_handlers: Vec::new(),
             effect_sink: None,
+            epoch,
+            decision_seq: Arc::new(AtomicU64::new(0)),
+            effect_seq: Arc::new(AtomicU64::new(0)),
+            emission_seq: Arc::new(AtomicU64::new(0)),
+            stream_namespace,
         }
+    }
+
+    /// This generation's audit epoch. The engine reads it across a reload to
+    /// check the epoch actually increased.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Stamp this decision's stream identity and sequence numbers.
+    ///
+    /// A no-op when no sink is attached. The counters have to be dense over
+    /// the records that were actually emitted, so burning one on a record
+    /// nobody receives would show up downstream as a record that went missing.
+    fn stamp_decision_stream(&self, decisions: &mut DecisionLog) {
+        if self.audit_handlers.is_empty() {
+            return;
+        }
+        decisions.set_stream(
+            self.epoch,
+            compose_stream_id(self.stream_namespace.as_deref(), "decision"),
+            self.decision_seq.fetch_add(1, Ordering::Relaxed),
+            self.emission_seq.fetch_add(1, Ordering::Relaxed),
+        );
     }
 
     /// Install the durable log that irreversible effects are written to.
@@ -344,7 +421,17 @@ impl Executor {
     /// The sink is a projection of both, so anything that changes either has
     /// to re-run this or plugins keep being handed the previous pairing.
     fn rebuild_effect_sink(&mut self, log: Option<Arc<dyn DurableEffectLog>>) {
-        let sink = EffectSink::new(log, self.audit_handlers.clone());
+        let sink = EffectSink::new(
+            log,
+            self.audit_handlers.clone(),
+            EffectStream {
+                epoch: self.epoch,
+                stream_id: compose_stream_id(self.stream_namespace.as_deref(), "effect"),
+                stream_seq: Arc::clone(&self.effect_seq),
+                emission_seq: Arc::clone(&self.emission_seq),
+                handler_timeout: Duration::from_secs(self.config.timeout_seconds),
+            },
+        );
         self.effect_sink = if sink.is_empty() {
             None
         } else {
@@ -394,6 +481,7 @@ impl Executor {
         let mut decisions = DecisionLog::new();
         self.capture_entry_provenance(&mut decisions, payload, extensions);
         decisions.finalize(Verdict::Allow);
+        self.stamp_decision_stream(&mut decisions);
         self.emit_audit(payload, extensions, &decisions).await;
     }
 
@@ -560,6 +648,7 @@ impl Executor {
             .await
         {
             decisions.finalize(Verdict::Deny(v.clone()));
+            self.stamp_decision_stream(&mut decisions);
             self.emit_audit(&*current_payload, &current_extensions, &decisions)
                 .await;
             return (
@@ -608,6 +697,7 @@ impl Executor {
             .await
         {
             decisions.finalize(Verdict::Deny(violation.clone()));
+            self.stamp_decision_stream(&mut decisions);
             self.emit_audit(&*current_payload, &current_extensions, &decisions)
                 .await;
             return (
@@ -630,6 +720,7 @@ impl Executor {
         );
 
         decisions.finalize(Verdict::Allow);
+        self.stamp_decision_stream(&mut decisions);
         self.emit_audit(&*current_payload, &current_extensions, &decisions)
             .await;
         (
@@ -2816,5 +2907,193 @@ mod audit_seam_tests {
             .input_hash()
             .expect("an opted-in payload is hashed");
         assert!(hash.starts_with("sha256:"), "got {hash}");
+    }
+
+    // =====================================================================
+    // Audit stream sequencing
+    // =====================================================================
+    //
+    // The counters make two different claims. `stream_seq` is gap-free within
+    // its stream, so a gap is a lost record. `emission_seq` is shared with the
+    // effect stream, so the two can be merged back into the order they
+    // happened. A consumer that cannot rely on either has no way to tell a
+    // dropped record from a quiet period, which is the whole point.
+
+    async fn run_with(executor: &Executor, entries: &[HookEntry]) -> PipelineResult {
+        let tracker = tokio_util::task::TaskTracker::new();
+        let payload: Box<dyn PluginPayload> = Box::new(P("in".into()));
+        let (result, _bg) = executor
+            .execute(entries, payload, Extensions::default(), None, &tracker)
+            .await;
+        result
+    }
+
+    #[tokio::test]
+    async fn decision_sequence_numbers_are_dense_and_ordered() {
+        let executor = Executor::new(ExecutorConfig {
+            timeout_seconds: 5,
+            ..Default::default()
+        })
+        .with_audit_handlers(vec![Arc::new(Recorder::default())]);
+        let entries = [entry("a", PluginMode::Sequential, Act::Allow)];
+
+        let mut seqs = Vec::new();
+        for _ in 0..5 {
+            let log = run_with(&executor, &entries).await.decision_log;
+            seqs.push(log.stream_seq().expect("a stamped record"));
+        }
+
+        assert_eq!(seqs, [0, 1, 2, 3, 4], "no gaps, so no record looks lost");
+    }
+
+    #[tokio::test]
+    async fn every_stamped_record_carries_the_stream_it_belongs_to() {
+        let executor = Executor::new(ExecutorConfig {
+            timeout_seconds: 5,
+            ..Default::default()
+        })
+        .with_audit_handlers(vec![Arc::new(Recorder::default())]);
+        let entries = [entry("a", PluginMode::Sequential, Act::Allow)];
+
+        let log = run_with(&executor, &entries).await.decision_log;
+
+        assert_eq!(log.stream_id(), Some("decision"));
+        assert_eq!(log.epoch(), Some(executor.epoch()));
+        assert_eq!(log.emission_seq(), Some(0));
+    }
+
+    /// A namespace attributes records to one process, and the type suffix has
+    /// to survive it, or the two streams merge and neither stays gap-free.
+    #[tokio::test]
+    async fn a_namespace_prefixes_the_stream_but_keeps_the_type() {
+        let executor = Executor::new(ExecutorConfig {
+            timeout_seconds: 5,
+            audit_stream_namespace: Some("gw-1".to_owned()),
+            ..Default::default()
+        })
+        .with_audit_handlers(vec![Arc::new(Recorder::default())]);
+        let entries = [entry("a", PluginMode::Sequential, Act::Allow)];
+
+        let log = run_with(&executor, &entries).await.decision_log;
+
+        assert_eq!(log.stream_id(), Some("gw-1:decision"));
+    }
+
+    /// Counting a record nobody received would look downstream exactly like a
+    /// record that went missing.
+    #[tokio::test]
+    async fn nothing_is_counted_when_no_sink_will_receive_it() {
+        let executor = Executor::new(ExecutorConfig {
+            timeout_seconds: 5,
+            ..Default::default()
+        });
+        let entries = [entry("a", PluginMode::Sequential, Act::Allow)];
+
+        run_with(&executor, &entries).await;
+        run_with(&executor, &entries).await;
+
+        // Attaching a sink now starts the stream at zero, because the earlier
+        // invocations emitted nothing and so consumed no sequence number.
+        let mut executor = executor;
+        executor.set_audit_handlers(vec![Arc::new(Recorder::default())]);
+        let log = run_with(&executor, &entries).await.decision_log;
+
+        assert_eq!(log.stream_seq(), Some(0));
+    }
+
+    /// A denied run is a record like any other, so it takes its place in the
+    /// stream rather than leaving a hole where a block happened.
+    #[tokio::test]
+    async fn a_deny_consumes_a_sequence_number_like_an_allow() {
+        let executor = Executor::new(ExecutorConfig {
+            timeout_seconds: 5,
+            ..Default::default()
+        })
+        .with_audit_handlers(vec![Arc::new(Recorder::default())]);
+
+        let allowed = [entry("a", PluginMode::Sequential, Act::Allow)];
+        let denied = [entry("b", PluginMode::Sequential, Act::Deny)];
+
+        let first = run_with(&executor, &allowed).await.decision_log;
+        let second = run_with(&executor, &denied).await.decision_log;
+        let third = run_with(&executor, &allowed).await.decision_log;
+
+        assert_eq!(
+            [
+                first.stream_seq().unwrap(),
+                second.stream_seq().unwrap(),
+                third.stream_seq().unwrap()
+            ],
+            [0, 1, 2]
+        );
+    }
+
+    /// The shared counter is what lets a reader interleave the two streams.
+    /// If effects had their own, a merged view could not be ordered.
+    #[tokio::test]
+    async fn decisions_and_effects_share_one_ordering_counter() {
+        #[derive(Debug, Default)]
+        struct SpyLog(Mutex<Vec<crate::effect::EffectRecord>>);
+
+        #[async_trait]
+        impl crate::effect::DurableEffectLog for SpyLog {
+            async fn append(
+                &self,
+                effect: &crate::effect::EffectRecord,
+            ) -> Result<(), Box<PluginError>> {
+                self.0.lock().unwrap().push(effect.clone());
+                Ok(())
+            }
+        }
+
+        let log = Arc::new(SpyLog::default());
+        let executor = Executor::new(ExecutorConfig {
+            timeout_seconds: 5,
+            ..Default::default()
+        })
+        .with_audit_handlers(vec![Arc::new(Recorder::default())])
+        .with_effect_log(log.clone());
+
+        let acted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cfg = PluginConfig {
+            name: "minter".into(),
+            mode: PluginMode::Sequential,
+            on_error: OnError::Ignore,
+            ..Default::default()
+        };
+        let entry = HookEntry {
+            plugin_ref: Arc::new(PluginRef::new(
+                Arc::new(EffectPlugin {
+                    cfg: cfg.clone(),
+                    acted: Arc::clone(&acted),
+                    refused: Arc::clone(&refused),
+                }),
+                cfg,
+            )),
+            handler: Arc::new(EffectPlugin {
+                cfg: PluginConfig::default(),
+                acted,
+                refused,
+            }),
+        };
+
+        let decision = run_with(&executor, std::slice::from_ref(&entry))
+            .await
+            .decision_log;
+        let effects = log.0.lock().unwrap().clone();
+
+        // The mint recorded an intent and an outcome, taking emission 0 and 1,
+        // and the decision that contained them was emitted after, taking 2.
+        assert_eq!(effects.len(), 2);
+        assert_eq!(effects[0].emission_seq, Some(0));
+        assert_eq!(effects[1].emission_seq, Some(1));
+        assert_eq!(decision.emission_seq(), Some(2));
+
+        // Each stream still counts from zero in its own right.
+        assert_eq!(effects[0].stream_seq, Some(0));
+        assert_eq!(effects[1].stream_seq, Some(1));
+        assert_eq!(decision.stream_seq(), Some(0));
+        assert_eq!(effects[0].stream_id.as_deref(), Some("effect"));
     }
 }

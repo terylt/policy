@@ -200,6 +200,29 @@ pub struct EngineSettings {
     /// operator opts into.
     #[serde(default)]
     pub capture_content_provenance: bool,
+
+    /// Prefix for the audit stream ids, so records from one process are
+    /// attributable to it rather than to the bare per-type labels.
+    ///
+    /// `gw-1` gives stream ids `gw-1:decision` and `gw-1:effect`. The type
+    /// suffix always survives, so each stream stays independently gap-free.
+    /// A consumer recovering the type splits on the last colon, since a
+    /// namespace may itself contain one. Empty or whitespace is refused at
+    /// load rather than producing a stream id starting with a colon.
+    #[serde(default)]
+    pub audit_stream_namespace: Option<String>,
+
+    /// Override the audit epoch, the executor's generation identifier.
+    ///
+    /// Deliberately not part of the YAML surface. The epoch has to strictly
+    /// increase per generation so a new one is distinguishable from records
+    /// going missing, and a value fixed in a file cannot do that: it would pin
+    /// the epoch across every restart and silently break the guarantee. A host
+    /// that sets this in code owns the invariant, and must supply a larger
+    /// value on every load, not once per boot, because a reload builds a fresh
+    /// executor with the counters back at zero.
+    #[serde(skip)]
+    pub audit_epoch: Option<u64>,
 }
 
 impl Default for EngineSettings {
@@ -212,6 +235,8 @@ impl Default for EngineSettings {
             effect_log_path: None,
             effect_log_compaction_threshold: None,
             capture_content_provenance: false,
+            audit_stream_namespace: None,
+            audit_epoch: None,
         }
     }
 }
@@ -2283,6 +2308,20 @@ pub(crate) fn validate_config(config: &PolicyConfig) -> Result<(), Box<PluginErr
     validate_declared_hooks(config)?;
     reject_reserved_route_names(config)?;
     validate_assertions(config)?;
+
+    // An empty namespace would compose stream ids like ":decision", which is
+    // neither the bare label nor a usable namespace, so refuse it rather than
+    // emit records nobody can attribute.
+    if let Some(ns) = &config.engine_settings.audit_stream_namespace
+        && ns.trim().is_empty()
+    {
+        {
+            return Err(Box::new(PluginError::Config {
+                message: "engine_settings.audit_stream_namespace is empty; remove the key to                           use the bare stream labels, or give it a value naming this process"
+                    .to_owned(),
+            }));
+        }
+    }
 
     let mut seen_names = HashSet::new();
     for plugin in &config.plugins {
@@ -9195,5 +9234,29 @@ plugins:
         );
         assert!(config.engine_settings.capture_content_provenance);
         assert_eq!(config.plugins[0].kind, "audit/logger");
+    }
+
+    /// An empty namespace would compose stream ids like ":decision", which is
+    /// neither the bare label nor an attributable one, so it is refused rather
+    /// than emitting records nobody can place.
+    #[test]
+    fn an_empty_audit_stream_namespace_is_rejected() {
+        let mut config = PolicyConfig::default();
+        config.engine_settings.audit_stream_namespace = Some("   ".to_owned());
+
+        let err = validate_config(&config).expect_err("an empty namespace must not load");
+
+        assert!(
+            err.to_string().contains("audit_stream_namespace"),
+            "the message must name the key to fix: {err}"
+        );
+    }
+
+    #[test]
+    fn a_named_audit_stream_namespace_loads() {
+        let mut config = PolicyConfig::default();
+        config.engine_settings.audit_stream_namespace = Some("gw-1".to_owned());
+
+        validate_config(&config).expect("a named namespace is fine");
     }
 }

@@ -156,6 +156,10 @@ pub struct DecisionLog {
     span: Option<Span>,
     input_labels: Vec<String>,
     input_hash: Option<String>,
+    epoch: Option<u64>,
+    stream_id: Option<String>,
+    stream_seq: Option<u64>,
+    emission_seq: Option<u64>,
 }
 
 impl DecisionLog {
@@ -217,6 +221,58 @@ impl DecisionLog {
     /// The content hash of the payload at entry, if it was captured.
     pub fn input_hash(&self) -> Option<&str> {
         self.input_hash.as_deref()
+    }
+
+    /// Stamp the audit stream identity and the two sequence numbers, assigned
+    /// by the executor at emission.
+    ///
+    /// The counters make two different claims and neither substitutes for the
+    /// other.
+    ///
+    /// - `epoch` is the executor's boot time in Unix nanoseconds, captured
+    ///   once. It scopes the counters, so a verifier can tell a counter reset
+    ///   (a new, larger epoch) from records that went missing (a gap inside
+    ///   one epoch). Being ordered, `(epoch, emission_seq)` totally orders
+    ///   records across restarts.
+    /// - `stream_id` is the per-type stream this record belongs to.
+    /// - `stream_seq` is a **completeness** claim: gap-free within
+    ///   `(epoch, stream_id)`, so a gap means a record was lost.
+    /// - `emission_seq` is an **ordering** claim only: monotonic across
+    ///   decisions and effects together, so the two can be interleaved back
+    ///   into the order they happened. A consumer reading one stream sees it
+    ///   sparse by design, and those gaps are the other stream's records
+    ///   rather than a loss.
+    pub fn set_stream(
+        &mut self,
+        epoch: u64,
+        stream_id: String,
+        stream_seq: u64,
+        emission_seq: u64,
+    ) {
+        self.epoch = Some(epoch);
+        self.stream_id = Some(stream_id);
+        self.stream_seq = Some(stream_seq);
+        self.emission_seq = Some(emission_seq);
+    }
+
+    /// The executor generation this record was emitted in.
+    pub fn epoch(&self) -> Option<u64> {
+        self.epoch
+    }
+
+    /// The per-type stream this record belongs to, which scopes `stream_seq`.
+    pub fn stream_id(&self) -> Option<&str> {
+        self.stream_id.as_deref()
+    }
+
+    /// Completeness counter, gap-free within `(epoch, stream_id)`.
+    pub fn stream_seq(&self) -> Option<u64> {
+        self.stream_seq
+    }
+
+    /// Ordering counter, monotonic across decisions and effects in the epoch.
+    pub fn emission_seq(&self) -> Option<u64> {
+        self.emission_seq
     }
 
     /// The ordered steps taken this invocation.

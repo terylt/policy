@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 
@@ -68,6 +68,27 @@ pub struct EffectRecord {
     /// Which plugin caused the effect. Stamped by the framework, never
     /// self-reported.
     pub plugin_name: Option<String>,
+
+    /// The executor generation this record was emitted in, as Unix
+    /// nanoseconds. Ordered, so a larger value marks a restart and a verifier
+    /// can tell a counter reset from records that went missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
+
+    /// The per-type stream this record belongs to, which scopes `stream_seq`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_id: Option<String>,
+
+    /// Completeness counter, gap-free within `(epoch, stream_id)`. A gap means
+    /// an effect record was lost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_seq: Option<u64>,
+
+    /// Ordering counter, shared with the decision stream, so effects and
+    /// decisions can be interleaved back into the order they happened. Sparse
+    /// for a reader of one stream, which is not a loss signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emission_seq: Option<u64>,
 }
 
 impl EffectRecord {
@@ -85,6 +106,10 @@ impl EffectRecord {
             state: EffectState::Prepared,
             details: HashMap::new(),
             plugin_name: None,
+            epoch: None,
+            stream_id: None,
+            stream_seq: None,
+            emission_seq: None,
         }
     }
 
@@ -471,6 +496,34 @@ impl FileEffectLog {
 pub struct EffectSink {
     log: Option<Arc<dyn DurableEffectLog>>,
     handlers: Vec<Arc<dyn crate::audit::AuditHandler>>,
+    /// Stream identity for effect records. The counters are shared with the
+    /// executor: `emission_seq` in particular is the same counter decisions
+    /// use, which is what lets the two streams be interleaved back into the
+    /// order they happened.
+    epoch: u64,
+    stream_id: String,
+    stream_seq: Arc<AtomicU64>,
+    emission_seq: Arc<AtomicU64>,
+    /// How long a sink gets before it is skipped, matching the decision path.
+    handler_timeout: std::time::Duration,
+}
+
+/// The stream identity an executor hands its effect sink.
+///
+/// Kept separate from the log and the handlers so the counters stay shared
+/// with the executor. Recreating them per sink would restart the sequences and
+/// break the completeness claim.
+pub struct EffectStream {
+    /// Executor generation, as Unix nanoseconds.
+    pub epoch: u64,
+    /// The composed per-type stream id for effects.
+    pub stream_id: String,
+    /// Effect completeness counter, gap-free within `(epoch, stream_id)`.
+    pub stream_seq: Arc<AtomicU64>,
+    /// Ordering counter shared with the decision stream.
+    pub emission_seq: Arc<AtomicU64>,
+    /// Per-sink budget before a slow sink is skipped.
+    pub handler_timeout: std::time::Duration,
 }
 
 impl std::fmt::Debug for EffectSink {
@@ -489,8 +542,17 @@ impl EffectSink {
     pub fn new(
         log: Option<Arc<dyn DurableEffectLog>>,
         handlers: Vec<Arc<dyn crate::audit::AuditHandler>>,
+        stream: EffectStream,
     ) -> Self {
-        Self { log, handlers }
+        Self {
+            log,
+            handlers,
+            epoch: stream.epoch,
+            stream_id: stream.stream_id,
+            stream_seq: stream.stream_seq,
+            emission_seq: stream.emission_seq,
+            handler_timeout: stream.handler_timeout,
+        }
     }
 
     /// Whether this sink would record anything at all.
@@ -732,17 +794,45 @@ impl crate::hooks::payload::Extensions {
         };
 
         let mut record = effect.clone().into_state(state);
-        // Attribution comes from the executor, so a record cannot claim to
-        // come from a plugin that did not produce it.
+        // Attribution and stream identity both come from the executor, so a
+        // record cannot claim to come from a plugin that did not produce it,
+        // nor place itself anywhere it likes in the stream.
         record.plugin_name = Some(plugin_name.to_string());
+        record.epoch = Some(sink.epoch);
+        record.stream_id = Some(sink.stream_id.clone());
+        record.stream_seq = Some(sink.stream_seq.fetch_add(1, Ordering::Relaxed));
+        record.emission_seq = Some(sink.emission_seq.fetch_add(1, Ordering::Relaxed));
 
         // Durability first. A sink that saw the event while the log rejected
         // it would report an act the write-ahead guarantee says never happened.
         if let Some(log) = &sink.log {
             log.append(&record).await?;
         }
+
+        // Isolated the way the decision emit is. This runs inside
+        // `perform_effect`, between recording the intent and the act, so a
+        // sink that panicked or hung here would take down the mint it is only
+        // observing.
+        use futures::FutureExt as _;
         for handler in &sink.handlers {
-            handler.on_effect(&record, self).await;
+            let call =
+                std::panic::AssertUnwindSafe(handler.on_effect(&record, self)).catch_unwind();
+            match tokio::time::timeout(sink.handler_timeout, call).await {
+                Ok(Ok(())) => {},
+                Ok(Err(_panic)) => {
+                    tracing::error!(
+                        "audit sink '{}' panicked observing an effect, contained",
+                        handler.name()
+                    );
+                },
+                Err(_elapsed) => {
+                    tracing::error!(
+                        "audit sink '{}' exceeded {}s observing an effect, skipped",
+                        handler.name(),
+                        sink.handler_timeout.as_secs()
+                    );
+                },
+            }
         }
         Ok(())
     }
@@ -1088,6 +1178,17 @@ mod tests {
         }
     }
 
+    /// A stream for tests: counters start at zero and nothing shares them.
+    fn test_stream() -> EffectStream {
+        EffectStream {
+            epoch: 42,
+            stream_id: "effect".to_owned(),
+            stream_seq: Arc::new(AtomicU64::new(0)),
+            emission_seq: Arc::new(AtomicU64::new(0)),
+            handler_timeout: std::time::Duration::from_secs(5),
+        }
+    }
+
     fn ext_with(slot: EffectLogSlot) -> Extensions {
         Extensions {
             effect_log: slot,
@@ -1097,7 +1198,7 @@ mod tests {
 
     fn recorded_ext(log: Arc<dyn DurableEffectLog>, plugin: &str) -> Extensions {
         ext_with(EffectLogSlot::recorded(
-            Arc::new(EffectSink::new(Some(log), Vec::new())),
+            Arc::new(EffectSink::new(Some(log), Vec::new(), test_stream())),
             plugin,
         ))
     }
