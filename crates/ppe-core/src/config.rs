@@ -1327,16 +1327,27 @@ const ROUTE_STRUCTURAL_KEYS: &[ConfigKey] = &[
     structural_key("response", KeyOwner::Apl),
 ];
 
-/// The keys the `engine_settings:` block carries, the [`EngineSettings`] fields.
+/// The keys the `engine_settings:` block carries, the [`EngineSettings`] fields
+/// that have a YAML spelling.
 ///
 /// [`EngineSettings`] drops an unknown field, so a setting the runtime never
 /// honored used to load clean and warn. The table is what makes it a load error
 /// naming its per-plugin replacement.
+///
+/// The table is the whole accept set, so a field this list omits is refused at
+/// load however well [`EngineSettings`] reads it. `audit_epoch` is the one
+/// field deliberately absent: it is `#[serde(skip)]` and settable only by a
+/// host in code, so a line here would accept a YAML key that pins the epoch
+/// across restarts, which is the guarantee the epoch exists to give.
 const ENGINE_SETTINGS_KEYS: &[ConfigKey] = &[
     structural_key("dispatch", KeyOwner::Core),
     structural_key("plugin_timeout", KeyOwner::Core),
     structural_key("short_circuit_on_deny", KeyOwner::Core),
     structural_key("route_cache_max_entries", KeyOwner::Core),
+    structural_key("effect_log_path", KeyOwner::Core),
+    structural_key("effect_log_compaction_threshold", KeyOwner::Core),
+    structural_key("capture_content_provenance", KeyOwner::Core),
+    structural_key("audit_stream_namespace", KeyOwner::Core),
 ];
 
 /// The keys one map-form step of an `authentication:` block carries.
@@ -9207,6 +9218,11 @@ routes:
     /// The configuration in `docs/auditing.md` has to load. A doc whose
     /// examples do not parse is worse than no doc: it sends an operator
     /// debugging their YAML instead of their policy.
+    ///
+    /// Through `parse_config` rather than `serde_yaml`, because the allowlist
+    /// is the half that rejects: a typed parse drops a key the table omits and
+    /// succeeds, so only the loader catches the doc and `ENGINE_SETTINGS_KEYS`
+    /// disagreeing.
     #[test]
     fn the_documented_auditing_config_loads() {
         let yaml = "
@@ -9214,6 +9230,7 @@ engine_settings:
   effect_log_path: /var/lib/praxis/effects.ndjson
   effect_log_compaction_threshold: 1024
   capture_content_provenance: true
+  audit_stream_namespace: gw-1
 plugins:
   - name: audit
     kind: audit/logger
@@ -9222,8 +9239,7 @@ plugins:
       destination: stderr
       source: gateway-eu-1
 ";
-        let config: PolicyConfig =
-            serde_yaml::from_str(yaml).expect("the documented config must parse");
+        let config = parse_config(yaml).expect("the documented config must load");
         assert_eq!(
             config.engine_settings.effect_log_path.as_deref(),
             Some("/var/lib/praxis/effects.ndjson")
@@ -9233,6 +9249,10 @@ plugins:
             Some(1024)
         );
         assert!(config.engine_settings.capture_content_provenance);
+        assert_eq!(
+            config.engine_settings.audit_stream_namespace.as_deref(),
+            Some("gw-1")
+        );
         assert_eq!(config.plugins[0].kind, "audit/logger");
     }
 
@@ -9258,5 +9278,45 @@ plugins:
         config.engine_settings.audit_stream_namespace = Some("gw-1".to_owned());
 
         validate_config(&config).expect("a named namespace is fine");
+    }
+
+    /// [`ENGINE_SETTINGS_KEYS`] is synced by hand with [`EngineSettings`], so
+    /// a field can be added to the struct, read by the runtime, and refused by
+    /// the loader for every config that sets it. This holds the two together
+    /// across every field rather than the ones a test names.
+    ///
+    /// `audit_epoch` is `#[serde(skip)]`, so it is absent from both sides and
+    /// the comparison stays honest about it having no YAML spelling.
+    #[test]
+    fn every_engine_setting_field_is_an_accepted_key() {
+        let serialized = serde_yaml::to_value(EngineSettings::default())
+            .expect("engine settings must serialize");
+        let fields = serialized
+            .as_mapping()
+            .expect("engine settings serialize as a mapping");
+
+        for key in fields.keys() {
+            let name = key.as_str().expect("field names are strings");
+            assert!(
+                ENGINE_SETTINGS_KEYS.iter().any(|k| k.name == name),
+                "`{name}` is an EngineSettings field but not an accepted key, \
+                 so a config setting it is refused at load"
+            );
+        }
+    }
+
+    /// The epoch strictly increases per generation, which a value fixed in a
+    /// file cannot do: pinned across restarts, it makes records going missing
+    /// indistinguishable from a new generation. The loader refuses the key so
+    /// the only way to set it stays the host code that owns the invariant.
+    #[test]
+    fn the_audit_epoch_has_no_yaml_key() {
+        let err = parse_config("engine_settings:\n  audit_epoch: 7\n")
+            .expect_err("audit_epoch must not be settable from YAML");
+
+        assert!(
+            err.to_string().contains("audit_epoch"),
+            "the message must name the refused key: {err}"
+        );
     }
 }
