@@ -8,7 +8,7 @@ pinned stable toolchain, so nothing here needs nightly.
 
 ## Before opening a pull request
 
-```
+```console
 make lint
 make test
 make audit
@@ -63,8 +63,10 @@ change the code safely. Some things that feel worth writing down are not:
 // modules. Dropping either hides tests without failing.
 ```
 
-Some documentation is generated from source comments. `make lint` regenerates and
-compares it, so run the full gate rather than `cargo clippy` alone.
+`make doc` builds the rustdoc with warnings denied, `make docs-lint` checks
+the markdown under `docs/`, and `make docs-links` checks documentation links.
+None runs as part of `make lint`, so run the relevant checks when you touch
+documentation.
 
 ## Durable text carries no planning identifiers
 
@@ -76,7 +78,7 @@ Those documents do not ship with the code. An identifier is meaningless to
 someone reading the commit a year from now, and it rots the moment the document
 changes or moves. Describe the behavior or the reason instead:
 
-```
+```text
 # no
 fix: address R24 fail-closed requirement in parser
 

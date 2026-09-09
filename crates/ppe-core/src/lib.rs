@@ -20,7 +20,7 @@
 // - [`audit`] — AuditHandler, the observation-only verdict sink
 // - [`decision`] — DecisionLog, the executor's record of a pipeline run
 // - [`effect`] — irreversible external acts, recorded write-ahead
-// - [`cmf`] — ContextForge Message Format (Message, ContentPart, enums)
+// - [`cmf`] — Common Message Format (Message, ContentPart, enums)
 // - [`identity`] — IdentityResolve hook family (subject / client /
 //                   workload resolution from raw credentials)
 // - [`delegation`] — TokenDelegate hook family (outbound credential
@@ -39,7 +39,7 @@
 pub mod assertions;
 /// Observation-only sinks that see each pipeline verdict.
 pub mod audit;
-/// The common message format: messages, content parts, and read-only views.
+/// The Common Message Format: messages, content parts, and read-only views.
 pub mod cmf;
 /// YAML configuration parsing for plugins, routes, and policies.
 pub mod config;

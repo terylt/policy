@@ -19,6 +19,8 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Added PPE documentation ([#82](https://github.com/praxis-proxy/policy/pull/82))
+
 - **Every verdict now reaches an audit sink, denials included.** An observation-only plugin runs as a post-hook, so it only ever saw traffic that was allowed through: a blocked call, an approval rejection, or a delegation failure produced no audit record at all. The executor now builds a `DecisionLog` recording what each plugin did and how the pipeline ruled, and hands it to any registered sink at the verdict itself rather than in a pipeline phase, so allow, deny, and modify all produce exactly one record. A hook resolving to zero plugins emits one allow record too, so a consumer counting records per invocation does not read "nothing configured" as a dropped record.
 
   A plugin becomes a sink by overriding `Plugin::as_audit_handler`. Sinks return `()`, so a sink can see a verdict but cannot influence it, and the decision log never reaches `PluginContext`, so an ordinary plugin cannot read what the sink reads. Sink calls are bounded by the plugin timeout with panics contained: a sink that fails is logged and skipped rather than taking down the request whose verdict is already decided.
@@ -43,15 +45,15 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 > **Upgrading from 0.1.0?** Configurations require changes: this release removes ten keys, changes the default dispatch mode, and tightens APL lexical rules. `docs/upgrade-apl.md` lists the required rewrites with before-and-after examples.
 >
-> `docs/apl-grammar.md` is the normative APL grammar, replacing the parser's inline grammar comments.
+> `docs/content/apl/apl-grammar.md` is the normative APL grammar, replacing the parser's inline grammar comments.
 
 ### Added
 
 - **`assertions:` controls headers at trust boundaries.** Available alongside `authentication:` at global, default, bundle, and route scope, request assertions map engine-derived values such as `subject.id` and `claim.<name>` to upstream headers; response assertions strip or replace upstream headers. Target headers are removed before rendering, preventing a missing value from preserving client-supplied data under a trusted name.
 
-  More-specific `headers:` entries replace matching targets, `strip:` entries accumulate, and `replace_inherited: true` resets inherited rules. Tokens and peer-supplied headers cannot be sources, while fixed protocol floors protect required request and response headers. Invalid or conflicting entries fail configuration loading with their location. Assertions run after the applicable policy phase and are unsigned, so recipients must trust the network path. See `docs/assertions.md`. ([#28](https://github.com/praxis-proxy/policy/issues/28))
+  More-specific `headers:` entries replace matching targets, `strip:` entries accumulate, and `replace_inherited: true` resets inherited rules. Tokens and peer-supplied headers cannot be sources, while fixed protocol floors protect required request and response headers. Invalid or conflicting entries fail configuration loading with their location. Assertions run after the applicable policy phase and are unsigned, so recipients must trust the network path. See `docs/content/assertions.md`. ([#28](https://github.com/praxis-proxy/policy/issues/28))
 
-- **`docs/apl-grammar.md` is now the normative APL grammar.** It documents the EBNF, lexical rules, precedence, valid syntax by position, YAML shape, dispatch-mode keys, and intentional quirks. Conformance tests keep the parser and document aligned with accepted and rejected cases for every production, documented quirk, and breaking change.
+- **`docs/content/apl/apl-grammar.md` is now the normative APL grammar.** It documents the EBNF, lexical rules, precedence, valid syntax by position, steps, field pipelines, and invalid forms. Conformance tests keep the parser and document aligned with accepted and rejected cases.
 
 - **`response:`, the custom denial block, documented at last.** It shipped in 0.1.0 undocumented. A `response:` block on a route, a bundle, a `global.defaults.<entity>:` entry, or `global:` supplies the status and body a denial renders, and the most-specific layer wins on collision. `None` leaves the host's default denial behavior. Its resolution rule changed in this release too, which the Changed section covers.
 
