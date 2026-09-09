@@ -55,9 +55,8 @@ hashbrown = { workspace = true }
 # the request whose verdict it is only observing.
 futures = { workspace = true }
 # Content-addressed audit provenance: only the digest of a payload is ever
-# recorded, never the payload. Pinned to the same 0.11 as the three other
-# crates that hash, so the tree carries one `sha2` and one `digest`.
-sha2 = "0.11"
+# recorded, never the payload.
+sha2 = { workspace = true }
 arc-swap = { workspace = true }
 wildmatch = { workspace = true }
 chrono = { workspace = true }
