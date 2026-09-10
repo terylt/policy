@@ -257,6 +257,30 @@ impl OAuthDelegator {
             })
     }
 
+    /// Attach the mint's effect key, when the operator has named a header to
+    /// carry it.
+    ///
+    /// Unset by default and a no-op then, because there is nowhere standard to
+    /// put it: the token endpoint takes no idempotency or client-reference
+    /// parameter in either RFC 6749 or RFC 8693. Sending a header of our own
+    /// invention to every `IdP` would claim a guarantee neither spec makes, so
+    /// the operator names one their `IdP` actually honours or nothing is sent.
+    fn with_idempotency_key(
+        &self,
+        request: HttpRequest,
+        key: &str,
+    ) -> Result<HttpRequest, Box<PluginViolation>> {
+        let Some(header) = self.typed.idempotency_header.as_deref() else {
+            return Ok(request);
+        };
+        request.header(header, key).map_err(|e| {
+            Box::new(PluginViolation::new(
+                "delegation.bad_request",
+                format!("could not attach the idempotency header `{header}`: {e}"),
+            ))
+        })
+    }
+
     /// `Authorization: Basic base64(client_id:client_secret)`.
     ///
     /// Built here rather than in the transport for the same reason as
@@ -334,13 +358,22 @@ impl OAuthDelegator {
             ),
             ("client_assertion", svid),
         ];
+        // The key comes first so it can travel with the request. Generating it
+        // inside `audit_mint`, after the request was already assembled, left it
+        // provably absent from what the IdP saw, which is the one thing that
+        // could have made an indeterminate mint answerable.
+        let key = new_effect_key();
         // Built before the intent is recorded. A request we could not even
         // assemble was never sent, so it is not an effect and must not leave
         // one to reconcile.
-        let request = self.token_request(&form).map_err(|v| *v)?;
+        let request = self
+            .token_request(&form)
+            .and_then(|r| self.with_idempotency_key(r, &key));
+        let request = request.map_err(|v| *v)?;
 
         self.audit_mint(
             ext,
+            &key,
             "workload client_assertion mint",
             &[("leg", "client_assertion")],
             || async {
@@ -399,6 +432,7 @@ impl OAuthDelegator {
     async fn audit_mint<F, Fut, T>(
         &self,
         ext: &Extensions,
+        key: &str,
         description: &str,
         details: &[(&str, &str)],
         mint: F,
@@ -407,7 +441,7 @@ impl OAuthDelegator {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T, PluginViolation>>,
     {
-        let mut intent = EffectRecord::prepared("token_mint", description, new_effect_key())
+        let mut intent = EffectRecord::prepared("token_mint", description, key)
             .with_detail("token_endpoint", self.typed.token_endpoint.clone());
         for (k, v) in details {
             intent = intent.with_detail(*k, (*v).to_owned());
@@ -593,9 +627,16 @@ impl OAuthDelegator {
         // Same non-idempotency as leg 1, and it matters more here: this
         // is the exchange that mints the delegated credential. Retrying a
         // timed-out exchange could leave a live token nobody is tracking.
+        //
+        // Same ordering as leg 1: the key exists before the request does, so
+        // an operator who has named an idempotency header gets it sent.
+        let key = new_effect_key();
         let request = match self.token_request(&form) {
             Ok(r) => match r.header("authorization", self.basic_auth_header()) {
-                Ok(r) => r,
+                Ok(r) => match self.with_idempotency_key(r, &key) {
+                    Ok(r) => r,
+                    Err(v) => return Err(*v),
+                },
                 Err(e) => {
                     return Err(PluginViolation::new(
                         "delegation.bad_request",
@@ -613,6 +654,7 @@ impl OAuthDelegator {
         let parsed = self
             .audit_mint(
                 ext,
+                &key,
                 "token exchange",
                 &[("audience", audience), ("scope", scope.as_str())],
                 || async {

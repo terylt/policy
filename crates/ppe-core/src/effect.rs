@@ -189,8 +189,7 @@ pub trait DurableEffectLog: Send + Sync + std::fmt::Debug {
     async fn append(&self, effect: &EffectRecord) -> Result<(), Box<PluginError>>;
 
     /// Recover after a restart: drop completed effects and reconcile the
-    /// unresolved ones, recording each resolved outcome durably. Returns the
-    /// effects still unresolved, for a later sweep.
+    /// unresolved ones, recording each resolved outcome durably.
     ///
     /// The default is a no-op, for logs with no recoverable on-disk state.
     ///
@@ -200,9 +199,25 @@ pub trait DurableEffectLog: Send + Sync + std::fmt::Debug {
     async fn recover_and_reconcile(
         &self,
         _reconciler: &dyn EffectReconciler,
-    ) -> Result<Vec<EffectRecord>, Box<PluginError>> {
-        Ok(Vec::new())
+    ) -> Result<RecoveryOutcome, Box<PluginError>> {
+        Ok(RecoveryOutcome::default())
     }
+}
+
+/// What a recovery sweep settled and what it could not.
+///
+/// `resolved` exists because the answer reconciliation produced is otherwise
+/// unobservable: it is appended and compacted away in the same call, so
+/// nothing outside the log ever learns that the mint nobody could account for
+/// turned out to have landed. The caller emits these to the audit sinks, which
+/// is the only place that answer reaches anyone.
+#[derive(Debug, Default)]
+pub struct RecoveryOutcome {
+    /// Effects reconciliation moved to a terminal state, in the order it
+    /// settled them. Already durable when this returns.
+    pub resolved: Vec<EffectRecord>,
+    /// Effects still unresolved, retained in the log for a later sweep.
+    pub unresolved: Vec<EffectRecord>,
 }
 
 /// Appends between automatic compactions. Effects are rare, so this bounds the
@@ -315,25 +330,28 @@ impl DurableEffectLog for FileEffectLog {
     async fn recover_and_reconcile(
         &self,
         reconciler: &dyn EffectReconciler,
-    ) -> Result<Vec<EffectRecord>, Box<PluginError>> {
+    ) -> Result<RecoveryOutcome, Box<PluginError>> {
         let summary = self.recover().await?;
-        let mut resolved_any = false;
-        let mut still_unknown = Vec::new();
+        let mut outcome = RecoveryOutcome::default();
         for rec in summary.unresolved {
             match reconciler.reconcile(&rec).await {
                 state @ (EffectState::Confirmed | EffectState::Rejected) => {
-                    self.append(&rec.clone().into_state(state)).await?;
-                    resolved_any = true;
+                    let settled = rec.into_state(state);
+                    self.append(&settled).await?;
+                    // Returned rather than dropped: the compaction below
+                    // erases the pair, so this record is the only trace of
+                    // what reconciliation concluded, and the caller emits it.
+                    outcome.resolved.push(settled);
                 },
                 // Still unresolved. Keep it for the next sweep.
-                _ => still_unknown.push(rec),
+                _ => outcome.unresolved.push(rec),
             }
         }
-        if resolved_any {
+        if !outcome.resolved.is_empty() {
             // A second pass drops the pairs the reconciler just completed.
             self.recover().await?;
         }
-        Ok(still_unknown)
+        Ok(outcome)
     }
 }
 
@@ -398,13 +416,45 @@ impl FileEffectLog {
         // and is lost to the rename.
         let _guard = self.write_lock.lock().await;
         tokio::task::spawn_blocking(move || -> Result<RecoverySummary, Box<PluginError>> {
-            let data = match std::fs::read_to_string(path.as_ref()) {
+            let raw = match std::fs::read(path.as_ref()) {
                 Ok(d) => d,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     return Ok(RecoverySummary::default());
                 },
                 Err(e) => return Err(wal_error("read the log", Some(Box::new(e)))),
             };
+
+            // Every complete append ends in a newline, so anything after the
+            // last one is an append a crash interrupted part-way through
+            // `write_all`. That is not corruption and must not stop recovery:
+            // the record it would have written was never acknowledged, so the
+            // act it guarded never proceeded, and the rewrite below drops it.
+            //
+            // Cut on bytes rather than reading the file as text first. A torn
+            // write can land mid-character, and `read_to_string` on a file
+            // ending in half a UTF-8 sequence fails the same permanent way a
+            // parse error used to: recovery never completes, so reconciliation
+            // never runs and compaction never bounds the file, while appends
+            // keep succeeding because they never read it.
+            let complete = match raw.iter().rposition(|b| *b == b'\n') {
+                Some(end) => raw.get(..=end).unwrap_or_default(),
+                // No newline anywhere: an empty file, or one holding nothing
+                // but a single interrupted append.
+                None => &[],
+            };
+            if complete.len() != raw.len() {
+                tracing::warn!(
+                    bytes = raw.len() - complete.len(),
+                    "effect log: discarding an unterminated final line, an append a crash \
+                     interrupted before it was acknowledged"
+                );
+            }
+            // Past the tail, the file is what this process wrote and fsync'd.
+            // A line that will not decode or parse here means it was damaged
+            // after the fact, and recovery refuses rather than silently
+            // dropping records that account for irreversible acts.
+            let data = std::str::from_utf8(complete)
+                .map_err(|e| wal_error("decode the log", Some(Box::new(e))))?;
 
             let mut records: Vec<EffectRecord> = Vec::new();
             for (i, line) in data.lines().enumerate() {
@@ -495,7 +545,7 @@ impl FileEffectLog {
 #[derive(Default)]
 pub struct EffectSink {
     log: Option<Arc<dyn DurableEffectLog>>,
-    handlers: Vec<Arc<dyn crate::audit::AuditHandler>>,
+    handlers: Vec<crate::audit::AttachedSink>,
     /// Stream identity for effect records. The counters are shared with the
     /// executor: `emission_seq` in particular is the same counter decisions
     /// use, which is what lets the two streams be interleaved back into the
@@ -541,7 +591,7 @@ impl EffectSink {
     /// and one that configured sinks but no log still gets the events.
     pub fn new(
         log: Option<Arc<dyn DurableEffectLog>>,
-        handlers: Vec<Arc<dyn crate::audit::AuditHandler>>,
+        handlers: Vec<crate::audit::AttachedSink>,
         stream: EffectStream,
     ) -> Self {
         Self {
@@ -563,6 +613,70 @@ impl EffectSink {
     /// The durable log, for the engine to run recovery against.
     pub fn log(&self) -> Option<Arc<dyn DurableEffectLog>> {
         self.log.clone()
+    }
+
+    /// Stamp a record into this stream and hand it to every sink.
+    ///
+    /// Writes nothing: each caller has its own durability story.
+    /// `Extensions::emit_effect` appends first, because a sink must never see
+    /// an act the log rejected. Recovery has already appended by the time it
+    /// gets here.
+    pub(crate) async fn notify(
+        &self,
+        mut record: EffectRecord,
+        extensions: &crate::hooks::payload::Extensions,
+    ) {
+        self.stamp(&mut record);
+        self.dispatch(&record, extensions).await;
+    }
+
+    /// Place a record in this stream. The counters are the executor's, so a
+    /// record cannot put itself anywhere it likes.
+    fn stamp(&self, record: &mut EffectRecord) {
+        record.epoch = Some(self.epoch);
+        record.stream_id = Some(self.stream_id.clone());
+        record.stream_seq = Some(self.stream_seq.fetch_add(1, Ordering::Relaxed));
+        record.emission_seq = Some(self.emission_seq.fetch_add(1, Ordering::Relaxed));
+    }
+
+    /// Hand one already-stamped record to every attached sink.
+    async fn dispatch(
+        &self,
+        record: &EffectRecord,
+        extensions: &crate::hooks::payload::Extensions,
+    ) {
+        // Isolated the way the decision emit is. This runs inside
+        // `perform_effect`, between recording the intent and the act, so a
+        // sink that panicked or hung here would take down the mint it is only
+        // observing.
+        use futures::FutureExt as _;
+        for observer in &self.handlers {
+            // `extensions` is the acting plugin's view, and it carries that
+            // plugin's live effect slot. Handing it over would let a sink append
+            // records under the name of the plugin it is watching, which for a
+            // log whose purpose is accounting is worse than a missing record.
+            // Filtering rebuilds the view against the sink's own capabilities
+            // and leaves the effect slot detached.
+            let view = observer.view(extensions);
+            let call = std::panic::AssertUnwindSafe(observer.handler().on_effect(record, &view))
+                .catch_unwind();
+            match tokio::time::timeout(self.handler_timeout, call).await {
+                Ok(Ok(())) => {},
+                Ok(Err(_panic)) => {
+                    tracing::error!(
+                        "audit sink '{}' panicked observing an effect, contained",
+                        observer.name()
+                    );
+                },
+                Err(_elapsed) => {
+                    tracing::error!(
+                        "audit sink '{}' exceeded {}s observing an effect, skipped",
+                        observer.name(),
+                        self.handler_timeout.as_secs()
+                    );
+                },
+            }
+        }
     }
 }
 
@@ -798,10 +912,7 @@ impl crate::hooks::payload::Extensions {
         // record cannot claim to come from a plugin that did not produce it,
         // nor place itself anywhere it likes in the stream.
         record.plugin_name = Some(plugin_name.to_string());
-        record.epoch = Some(sink.epoch);
-        record.stream_id = Some(sink.stream_id.clone());
-        record.stream_seq = Some(sink.stream_seq.fetch_add(1, Ordering::Relaxed));
-        record.emission_seq = Some(sink.emission_seq.fetch_add(1, Ordering::Relaxed));
+        sink.stamp(&mut record);
 
         // Durability first. A sink that saw the event while the log rejected
         // it would report an act the write-ahead guarantee says never happened.
@@ -809,31 +920,7 @@ impl crate::hooks::payload::Extensions {
             log.append(&record).await?;
         }
 
-        // Isolated the way the decision emit is. This runs inside
-        // `perform_effect`, between recording the intent and the act, so a
-        // sink that panicked or hung here would take down the mint it is only
-        // observing.
-        use futures::FutureExt as _;
-        for handler in &sink.handlers {
-            let call =
-                std::panic::AssertUnwindSafe(handler.on_effect(&record, self)).catch_unwind();
-            match tokio::time::timeout(sink.handler_timeout, call).await {
-                Ok(Ok(())) => {},
-                Ok(Err(_panic)) => {
-                    tracing::error!(
-                        "audit sink '{}' panicked observing an effect, contained",
-                        handler.name()
-                    );
-                },
-                Err(_elapsed) => {
-                    tracing::error!(
-                        "audit sink '{}' exceeded {}s observing an effect, skipped",
-                        handler.name(),
-                        sink.handler_timeout.as_secs()
-                    );
-                },
-            }
-        }
+        sink.dispatch(&record, self).await;
         Ok(())
     }
 }
@@ -1014,8 +1101,13 @@ mod tests {
             .unwrap();
 
         assert!(
-            still.is_empty(),
+            still.unresolved.is_empty(),
             "the ledger answered, so nothing is left open"
+        );
+        assert_eq!(
+            still.resolved.len(),
+            1,
+            "and the answer is returned, for the caller to emit"
         );
         assert!(
             lines(&path).is_empty(),
@@ -1039,13 +1131,126 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(still.len(), 1);
-        assert_eq!(still[0].key, "orphan");
+        assert_eq!(still.unresolved.len(), 1);
+        assert_eq!(still.unresolved[0].key, "orphan");
+        assert!(still.resolved.is_empty());
         assert_eq!(
             lines(&path).len(),
             1,
             "and it survives in the log for a later sweep"
         );
+    }
+
+    // =================================================================
+    // A crash mid-append
+    // =================================================================
+    //
+    // `write_all` loops, so a crash can land between two of its writes and
+    // leave a final line with no newline, cut anywhere — including mid-
+    // character, which makes the file as a whole not valid UTF-8. Recovery
+    // used to refuse the whole file on either, and because a refusal is logged
+    // and stepped over at startup, the log was then permanently stuck:
+    // reconciliation never ran again and compaction never bounded the file,
+    // while appends kept succeeding because appending never reads it.
+
+    /// Append a raw fragment the way an interrupted `write_all` would leave
+    /// one: no trailing newline.
+    fn append_torn(path: &std::path::Path, fragment: &[u8]) {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("open the log");
+        f.write_all(fragment).expect("write the fragment");
+    }
+
+    #[tokio::test]
+    async fn a_torn_final_line_is_dropped_rather_than_failing_recovery() {
+        let path = wal_path("torn_tail");
+        let _c = Cleanup(path.clone());
+        let log = FileEffectLog::new(&path).with_compaction_threshold(0);
+        log.append(&EffectRecord::prepared("token_mint", "d", "orphan"))
+            .await
+            .unwrap();
+        // Half a record, which is what the crash left behind.
+        append_torn(&path, br#"{"key":"half-written","kind":"token_"#);
+
+        let summary = log.recover().await.expect("recovery completes");
+
+        assert_eq!(
+            summary.unresolved.len(),
+            1,
+            "the acknowledged record is still accounted for"
+        );
+        assert_eq!(summary.unresolved[0].key, "orphan");
+        assert_eq!(
+            lines(&path).len(),
+            1,
+            "and the rewrite drops the fragment, so the next sweep is clean"
+        );
+    }
+
+    /// A torn write can land mid-character, leaving the file invalid UTF-8.
+    /// Reading it as text first failed the same permanent way a parse error
+    /// did, so the cut is made on bytes.
+    #[tokio::test]
+    async fn a_torn_final_line_cut_mid_character_is_also_dropped() {
+        let path = wal_path("torn_utf8");
+        let _c = Cleanup(path.clone());
+        let log = FileEffectLog::new(&path).with_compaction_threshold(0);
+        log.append(&EffectRecord::prepared("token_mint", "d", "orphan"))
+            .await
+            .unwrap();
+        // The first byte of a three-byte sequence and nothing after it.
+        append_torn(&path, b"{\"key\":\"\xe2");
+
+        let summary = log.recover().await.expect("recovery completes");
+
+        assert_eq!(summary.unresolved.len(), 1);
+        assert_eq!(summary.unresolved[0].key, "orphan");
+    }
+
+    /// Only the tail is forgiven. A line that will not parse anywhere else was
+    /// acknowledged and then damaged, and recovery refuses rather than
+    /// silently dropping a record that accounts for an irreversible act.
+    #[tokio::test]
+    async fn a_malformed_line_that_is_not_the_tail_still_fails_recovery() {
+        let path = wal_path("corrupt_middle");
+        let _c = Cleanup(path.clone());
+        let log = FileEffectLog::new(&path).with_compaction_threshold(0);
+        log.append(&EffectRecord::prepared("token_mint", "d", "first"))
+            .await
+            .unwrap();
+        append_torn(&path, b"this was never a record\n");
+        log.append(&EffectRecord::prepared("token_mint", "d", "second"))
+            .await
+            .unwrap();
+
+        let err = log.recover().await.expect_err("corruption is refused");
+        assert!(
+            format!("{err}").contains("parse line"),
+            "and it says which line: {err}"
+        );
+    }
+
+    /// The torn tail is not mistaken for a resolved effect. An interrupted
+    /// append was never acknowledged, so the act it guarded never ran, and
+    /// dropping it leaves nothing to reconcile.
+    #[tokio::test]
+    async fn a_torn_intent_leaves_nothing_to_reconcile() {
+        let path = wal_path("torn_only");
+        let _c = Cleanup(path.clone());
+        let log = FileEffectLog::new(&path).with_compaction_threshold(0);
+        append_torn(&path, br#"{"key":"never-acknowledged"#);
+
+        let outcome = log
+            .recover_and_reconcile(&LogUnknownsReconciler)
+            .await
+            .expect("recovery completes");
+
+        assert!(outcome.unresolved.is_empty());
+        assert!(outcome.resolved.is_empty());
     }
 
     #[tokio::test]
@@ -1458,6 +1663,6 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(left.is_empty());
+        assert!(left.unresolved.is_empty());
     }
 }

@@ -1446,6 +1446,87 @@ async fn a_mint_does_not_happen_when_its_intent_cannot_be_recorded() {
     );
 }
 
+/// The key that identifies a mint exists before the request does, and travels
+/// with it when an operator has named a header to carry it.
+///
+/// Nothing in OAuth defines where to put it — neither RFC 6749 nor RFC 8693
+/// gives the token endpoint an idempotency or client-reference parameter — so
+/// the header is opt-in. What was wrong was the ordering: the key was minted
+/// inside the effect bracket, after the request had already been assembled, so
+/// it was provably absent from anything the `IdP` saw and no lookup by it could
+/// ever have succeeded.
+#[tokio::test]
+async fn a_named_idempotency_header_carries_the_effect_key_to_the_idp() {
+    let mut cfg = plugin_config(&token_endpoint());
+    let config = cfg.config.as_mut().expect("the delegator has config");
+    config["idempotency_header"] = json!("idempotency-key");
+    let delegator = OAuthDelegator::new(cfg.clone()).expect("delegator constructs");
+    let mgr = Arc::new(PolicyEngine::default());
+    mgr.register_handler_for_names::<TokenDelegateHook, _>(
+        Arc::new(delegator),
+        cfg,
+        &[HOOK_TOKEN_DELEGATE],
+    )
+    .unwrap();
+    let http = idp(200, &ok_token_response());
+    let transport: Arc<dyn HttpTransport> = http.clone();
+    mgr.set_http_transport(transport);
+    let log = Arc::new(SpyLog::default());
+    let log_dyn: Arc<dyn praxis_policy_core::effect::DurableEffectLog> = log.clone();
+    mgr.set_effect_log(log_dyn);
+    mgr.initialize().await.unwrap();
+
+    let result = invoke(
+        &mgr,
+        build_payload(
+            "tool",
+            "https://downstream.example.com",
+            &["read:compensation"],
+        ),
+    )
+    .await;
+    assert!(result.continue_processing);
+
+    let sent = http.last_request().expect("the IdP was called");
+    let header = sent
+        .headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .expect("the header was attached");
+    let records = log.records();
+    assert_eq!(
+        header, records[0].key,
+        "the IdP is sent the same key the effect log recorded, which is what a \
+         lookup by key would need"
+    );
+}
+
+/// Unset by default, so no header of our own invention reaches an `IdP` that
+/// never asked for one.
+#[tokio::test]
+async fn without_a_named_header_nothing_extra_is_sent() {
+    let http = idp(200, &ok_token_response());
+    let mgr = manager_with_log(&http, Arc::new(SpyLog::default())).await;
+
+    let result = invoke(
+        &mgr,
+        build_payload(
+            "tool",
+            "https://downstream.example.com",
+            &["read:compensation"],
+        ),
+    )
+    .await;
+    assert!(result.continue_processing);
+
+    let sent = http.last_request().expect("the IdP was called");
+    assert!(
+        sent.headers.get("idempotency-key").is_none(),
+        "no header unless one is named: {:?}",
+        sent.headers
+    );
+}
+
 /// With no log configured the delegator behaves exactly as it did before
 /// effects existed. This is the default an operator gets, and the reason
 /// auditing is not load-bearing.

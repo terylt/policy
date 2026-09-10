@@ -26,10 +26,18 @@ writes its own.
 
 ## What the engine promises
 
-A verdict that was reached is emitted. Emission happens at the executor's
-return points rather than in a pipeline phase, so allow, deny and modify all
-produce one record and nobody has to reason about which phase runs before which
-deny.
+A verdict that was reached is emitted, and the record says what the caller was
+told. Emission happens once per invocation, at the engine's return points
+rather than in a pipeline phase, so allow, deny and modify all produce one
+record and nobody has to reason about which phase runs before which deny.
+
+The engine's return points, specifically, and not the executor's. The pipeline
+is not the last thing that can change a verdict: the `assertions:` contract runs
+after it and can refuse a request the pipeline allowed. A record emitted before
+that would report a request as forwarded that the caller was refused, which is
+worse than no record because it reads as evidence. The same holds at the other
+end: a request denied before the pipeline starts, because no route resolved for
+it, still produces a record. Those are the requests most worth having one for.
 
 When an effect log is configured, a completed act has a durable record of its
 intent. The record is `fsync`ed before the act happens, and if it cannot be
@@ -53,6 +61,15 @@ layer can detect it.
 A plugin behaves the same whether or not auditing is on. There is no capability
 a plugin needs and no setting that makes a working deployment stop working.
 Turning auditing off costs the record, not the behavior.
+
+A sink observes and does nothing else, and the engine enforces that rather than
+trusting it. The extensions a sink is handed are filtered against the
+capabilities its own `plugins:` entry declares, exactly as a hook plugin's are:
+a sink that declares nothing sees the ungated slots, and one that wants headers
+or credential material asks for `read_headers` or `read_inbound_credentials`
+like anything else. A sink never receives the host's HTTP transport without
+`perform_http`, and the view it gets refuses effects outright, so a sink
+watching a plugin mint a token cannot write records under that plugin's name.
 
 What the engine does not promise is that a record reached storage before the
 response left. Sinks are awaited, but a sink that buffers internally before
@@ -92,6 +109,18 @@ act interrupted by a crash leaves nothing behind to follow up.
 The file holds one JSON record per line and is compacted in place: once an
 effect has both an intent and an outcome the pair is dropped, so it tracks what
 is in flight rather than growing without bound.
+
+A crash can interrupt an append part-way through its write, leaving a final line
+with no newline and possibly cut mid-character. Recovery treats that one line as
+the interrupted append it is and discards it: it was never acknowledged, so the
+act it guarded never proceeded. A line that will not parse anywhere else is
+corruption, and recovery refuses rather than silently dropping a record that
+accounts for an irreversible act.
+
+What reconciliation concludes is emitted to the sinks. The resolving record is
+appended and compacted away inside the same sweep, so the log is not where
+anyone reads it — without the emit, an effect that spent a restart unaccounted
+for would vanish with nobody told which way it went.
 
 A host that wires plugins in code calls `PolicyEngine::set_effect_log` before
 `initialize`. That install does not survive `load_config`, which rebuilds the
@@ -280,10 +309,19 @@ that can answer for the participant, if one is configured.
 In practice there is nothing to configure. The question an orphaned intent
 raises is "did this mint land at the IdP before we died", and an OAuth IdP has
 no endpoint that takes a mint key and reports whether that token was issued, so
-the question has nowhere to go.
+the question has nowhere to go. Nor is there a standard place to put the key on
+the way out: neither RFC 6749 nor RFC 8693 gives the token endpoint an
+idempotency or client-reference parameter. The OAuth delegator's
+`idempotency_header:` names one for an IdP that honours a vendor-specific
+header, and is unset by default so nothing invented reaches an IdP that never
+asked for it.
 
 The reconciler PPE ships by default connects to nothing. It records that the
 effect is unresolved, and leaves it `unknown` for an operator to chase.
+
+Whatever a reconciler does settle reaches the audit sinks as its own event. The
+resolving record is compacted out of the log in the same sweep that writes it,
+so the emit is where that answer surfaces.
 
 A host with an authoritative issuance ledger, one that does know what was
 minted, implements `EffectReconciler` and calls

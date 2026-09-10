@@ -519,10 +519,19 @@ impl PluginRegistry {
     /// The audit sinks among the registered plugins. A plugin opts in by
     /// overriding `Plugin::as_audit_handler`; most return `None`. The engine
     /// attaches these to the executor's verdict emit.
-    pub fn audit_handlers(&self) -> Vec<Arc<dyn crate::audit::AuditHandler>> {
+    ///
+    /// Each is paired with the capabilities its own `plugins:` entry declared,
+    /// because a sink reaches every invocation and is filtered on the same
+    /// terms as any other plugin. The capabilities come from `trusted_config`,
+    /// the engine's copy, not from anything the plugin reports about itself.
+    pub fn audit_handlers(&self) -> Vec<crate::audit::AttachedSink> {
         self.plugins
             .values()
-            .filter_map(|r| r.plugin().clone().as_audit_handler())
+            .filter_map(|r| {
+                let handler = r.plugin().clone().as_audit_handler()?;
+                let capabilities = r.trusted_config().capabilities.iter().cloned().collect();
+                Some(crate::audit::AttachedSink::new(handler, capabilities))
+            })
             .collect()
     }
 

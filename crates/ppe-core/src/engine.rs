@@ -231,6 +231,11 @@ fn deny_missing_assertion(
     let mut denied = PipelineResult::denied(violation, extensions, context_table);
     denied.errors = std::mem::take(&mut result.errors);
     denied.metadata = result.metadata.take();
+    // The pipeline ran, so its steps are what explain this denial as much as
+    // the assertion that caused it. Building a fresh result here used to drop
+    // them, leaving the caller an empty log on the one denial that has a full
+    // pipeline behind it. The verdict is corrected at the emit.
+    denied.decision_log = std::mem::take(&mut result.decision_log);
     denied
 }
 
@@ -1010,6 +1015,12 @@ impl PolicyEngine {
     /// The reconciler reads the self-describing record, so it is specific to
     /// the participant at most, never to the plugin that caused the effect.
     ///
+    /// Whatever reconciliation settles is emitted to the audit sinks before
+    /// this returns. Without that the answer would be unobservable: the
+    /// resolving record is appended and compacted away inside the same sweep,
+    /// so an effect that spent a restart unaccounted for would quietly vanish
+    /// from the log with nobody told which way it went.
+    ///
     /// # Errors
     ///
     /// Returns an error when the effect log cannot be read or rewritten.
@@ -1017,10 +1028,13 @@ impl PolicyEngine {
         &self,
         reconciler: &dyn crate::effect::EffectReconciler,
     ) -> Result<Vec<crate::effect::EffectRecord>, Box<PluginError>> {
-        match self.load_runtime().executor.effect_log() {
-            Some(log) => log.recover_and_reconcile(reconciler).await,
-            None => Ok(Vec::new()),
-        }
+        let snapshot = self.load_runtime();
+        let Some(log) = snapshot.executor.effect_log() else {
+            return Ok(Vec::new());
+        };
+        let outcome = log.recover_and_reconcile(reconciler).await?;
+        snapshot.executor.emit_reconciled(outcome.resolved).await;
+        Ok(outcome.unresolved)
     }
 
     /// Load the current runtime snapshot (lock-free, single atomic op).
@@ -1878,21 +1892,19 @@ impl PolicyEngine {
             // contract written on a route holds whether or not this hook has a
             // plugin on it.
             let matched = resolve_contract_route(&snapshot, &extensions);
-            snapshot
-                .executor
-                .emit_empty_allow(&*payload, &extensions)
-                .await;
             return (
-                self.apply_assertions(
+                self.finish(
                     &snapshot,
                     Some(hook_name),
                     matched.as_ref(),
+                    None,
                     PipelineResult::allowed_with(
                         payload,
                         extensions,
                         context_table.unwrap_or_default(),
                     ),
-                ),
+                )
+                .await,
                 BackgroundTasks::empty(),
             );
         }
@@ -1904,45 +1916,45 @@ impl PolicyEngine {
             Ok(resolved) => resolved,
             Err(cause) => {
                 return (
-                    self.apply_assertions(
+                    self.finish(
                         &snapshot,
                         Some(hook_name),
                         None,
+                        Some(payload),
                         PipelineResult::denied(
                             cause.violation(),
                             extensions,
                             context_table.unwrap_or_default(),
                         ),
-                    ),
+                    )
+                    .await,
                     BackgroundTasks::empty(),
                 );
             },
         };
         if entries.is_empty() {
-            snapshot
-                .executor
-                .emit_empty_allow(&*payload, &extensions)
-                .await;
             return (
-                self.apply_assertions(
+                self.finish(
                     &snapshot,
                     Some(hook_name),
                     matched.as_ref(),
+                    None,
                     PipelineResult::allowed_with(
                         payload,
                         extensions,
                         context_table.unwrap_or_default(),
                     ),
-                ),
+                )
+                .await,
                 BackgroundTasks::empty(),
             );
         }
 
-        let (result, tasks) = {
+        let (result, tasks, refused) = {
             let _boundary = self.enter_executor();
             snapshot
                 .executor
-                .execute(
+                .execute_audited(
                     &entries,
                     payload,
                     // Make the host's transport reachable; `filter_extensions`
@@ -1954,7 +1966,14 @@ impl PolicyEngine {
                 .await
         };
         (
-            self.apply_assertions(&snapshot, Some(hook_name), matched.as_ref(), result),
+            self.finish(
+                &snapshot,
+                Some(hook_name),
+                matched.as_ref(),
+                refused,
+                result,
+            )
+            .await,
             tasks,
         )
     }
@@ -2000,21 +2019,19 @@ impl PolicyEngine {
         if all_entries.is_empty() && snapshot.route_annotations.is_empty() {
             let boxed: Box<dyn PluginPayload> = Box::new(payload);
             let matched = resolve_contract_route(&snapshot, &extensions);
-            snapshot
-                .executor
-                .emit_empty_allow(&*boxed, &extensions)
-                .await;
             return (
-                self.apply_assertions(
+                self.finish(
                     &snapshot,
                     Some(H::NAME),
                     matched.as_ref(),
+                    None,
                     PipelineResult::allowed_with(
                         boxed,
                         extensions,
                         context_table.unwrap_or_default(),
                     ),
-                ),
+                )
+                .await,
                 BackgroundTasks::empty(),
             );
         }
@@ -2026,47 +2043,47 @@ impl PolicyEngine {
             Ok(resolved) => resolved,
             Err(cause) => {
                 return (
-                    self.apply_assertions(
+                    self.finish(
                         &snapshot,
                         Some(H::NAME),
                         None,
+                        Some(Box::new(payload)),
                         PipelineResult::denied(
                             cause.violation(),
                             extensions,
                             context_table.unwrap_or_default(),
                         ),
-                    ),
+                    )
+                    .await,
                     BackgroundTasks::empty(),
                 );
             },
         };
         if entries.is_empty() {
             let boxed: Box<dyn PluginPayload> = Box::new(payload);
-            snapshot
-                .executor
-                .emit_empty_allow(&*boxed, &extensions)
-                .await;
             return (
-                self.apply_assertions(
+                self.finish(
                     &snapshot,
                     Some(H::NAME),
                     matched.as_ref(),
+                    None,
                     PipelineResult::allowed_with(
                         boxed,
                         extensions,
                         context_table.unwrap_or_default(),
                     ),
-                ),
+                )
+                .await,
                 BackgroundTasks::empty(),
             );
         }
 
         let boxed: Box<dyn PluginPayload> = Box::new(payload);
-        let (result, tasks) = {
+        let (result, tasks, refused) = {
             let _boundary = self.enter_executor();
             snapshot
                 .executor
-                .execute(
+                .execute_audited(
                     &entries,
                     boxed,
                     // Make the host's transport reachable; `filter_extensions`
@@ -2078,7 +2095,8 @@ impl PolicyEngine {
                 .await
         };
         (
-            self.apply_assertions(&snapshot, Some(H::NAME), matched.as_ref(), result),
+            self.finish(&snapshot, Some(H::NAME), matched.as_ref(), refused, result)
+                .await,
             tasks,
         )
     }
@@ -2134,21 +2152,19 @@ impl PolicyEngine {
         if all_entries.is_empty() && snapshot.route_annotations.is_empty() {
             let boxed: Box<dyn PluginPayload> = Box::new(payload);
             let matched = resolve_contract_route(&snapshot, &extensions);
-            snapshot
-                .executor
-                .emit_empty_allow(&*boxed, &extensions)
-                .await;
             return (
-                self.apply_assertions(
+                self.finish(
                     &snapshot,
                     Some(hook_name),
                     matched.as_ref(),
+                    None,
                     PipelineResult::allowed_with(
                         boxed,
                         extensions,
                         context_table.unwrap_or_default(),
                     ),
-                ),
+                )
+                .await,
                 BackgroundTasks::empty(),
             );
         }
@@ -2160,47 +2176,47 @@ impl PolicyEngine {
             Ok(resolved) => resolved,
             Err(cause) => {
                 return (
-                    self.apply_assertions(
+                    self.finish(
                         &snapshot,
                         Some(hook_name),
                         None,
+                        Some(Box::new(payload)),
                         PipelineResult::denied(
                             cause.violation(),
                             extensions,
                             context_table.unwrap_or_default(),
                         ),
-                    ),
+                    )
+                    .await,
                     BackgroundTasks::empty(),
                 );
             },
         };
         if entries.is_empty() {
             let boxed: Box<dyn PluginPayload> = Box::new(payload);
-            snapshot
-                .executor
-                .emit_empty_allow(&*boxed, &extensions)
-                .await;
             return (
-                self.apply_assertions(
+                self.finish(
                     &snapshot,
                     Some(hook_name),
                     matched.as_ref(),
+                    None,
                     PipelineResult::allowed_with(
                         boxed,
                         extensions,
                         context_table.unwrap_or_default(),
                     ),
-                ),
+                )
+                .await,
                 BackgroundTasks::empty(),
             );
         }
 
         let boxed: Box<dyn PluginPayload> = Box::new(payload);
-        let (result, tasks) = {
+        let (result, tasks, refused) = {
             let _boundary = self.enter_executor();
             snapshot
                 .executor
-                .execute(
+                .execute_audited(
                     &entries,
                     boxed,
                     // Make the host's transport reachable; `filter_extensions`
@@ -2212,7 +2228,14 @@ impl PolicyEngine {
                 .await
         };
         (
-            self.apply_assertions(&snapshot, Some(hook_name), matched.as_ref(), result),
+            self.finish(
+                &snapshot,
+                Some(hook_name),
+                matched.as_ref(),
+                refused,
+                result,
+            )
+            .await,
             tasks,
         )
     }
@@ -2266,17 +2289,14 @@ impl PolicyEngine {
         self.warn_if_dispatch_has_no_boundary(&snapshot);
         if entries.is_empty() {
             let boxed: Box<dyn PluginPayload> = Box::new(payload);
-            snapshot
-                .executor
-                .emit_empty_allow(&*boxed, &extensions)
-                .await;
             return (
                 // `None`, so nothing is applied. Not an omission: this is a
                 // nested dispatch primitive rather than a wire boundary, and
                 // the contract belongs after policy evaluation, at the outer
                 // boundary this call runs inside.
-                self.apply_assertions(
+                self.finish(
                     &snapshot,
+                    None,
                     None,
                     None,
                     PipelineResult::allowed_with(
@@ -2284,16 +2304,17 @@ impl PolicyEngine {
                         extensions,
                         context_table.unwrap_or_default(),
                     ),
-                ),
+                )
+                .await,
                 BackgroundTasks::empty(),
             );
         }
         let boxed: Box<dyn PluginPayload> = Box::new(payload);
-        let (result, tasks) = {
+        let (result, tasks, refused) = {
             let _boundary = self.enter_executor();
             snapshot
                 .executor
-                .execute(
+                .execute_audited(
                     entries,
                     boxed,
                     // Make the host's transport reachable; `filter_extensions`
@@ -2304,7 +2325,10 @@ impl PolicyEngine {
                 )
                 .await
         };
-        (self.apply_assertions(&snapshot, None, None, result), tasks)
+        (
+            self.finish(&snapshot, None, None, refused, result).await,
+            tasks,
+        )
     }
 
     /// Override the resolved plugin list for one `(entity_type, entity_name)`
@@ -2386,6 +2410,56 @@ impl PolicyEngine {
         });
     }
 
+    /// Settle an invocation: run the assertion contract, then emit one audit
+    /// record carrying the verdict the caller is actually about to receive.
+    ///
+    /// Every return path of every invoke path goes through here, which is what
+    /// makes the audit stream one record per invocation with no exceptions.
+    /// Two things used to go wrong without it. The executor emitted before
+    /// `apply_assertions` ran, so an `on_missing: deny` assertion could refuse
+    /// a request a sink had already recorded as allowed. And a route that
+    /// failed to resolve denied without emitting at all, so the requests most
+    /// worth auditing were the ones missing from the stream.
+    ///
+    /// `fallback_payload` is the message for the emit when the result does not
+    /// carry one — a pipeline denial, or a route-resolution denial that never
+    /// reached the pipeline. The payload is put back on an allow, so the
+    /// result a caller sees is unchanged by having been audited.
+    async fn finish(
+        &self,
+        snapshot: &RuntimeSnapshot,
+        hook_name: Option<&str>,
+        matched: Option<&config::MatchedRoute<'_>>,
+        fallback_payload: Option<Box<dyn PluginPayload>>,
+        result: PipelineResult,
+    ) -> PipelineResult {
+        let (mut result, refused) = self.apply_assertions(snapshot, hook_name, matched, result);
+
+        // Taken out so the emit can borrow it while the log inside `result` is
+        // borrowed mutably, then put straight back.
+        let carried = result.modified_payload.take();
+        let verdict = match result.violation.as_ref() {
+            Some(v) => crate::decision::Verdict::Deny(v.clone()),
+            None => crate::decision::Verdict::Allow,
+        };
+        if let Some(payload) = carried
+            .as_deref()
+            .or(refused.as_deref())
+            .or(fallback_payload.as_deref())
+        {
+            // The extensions the pipeline finished with. Sinks are filtered
+            // from these per sink, inside the emit.
+            let extensions = result.modified_extensions.take().unwrap_or_default();
+            snapshot
+                .executor
+                .emit_decision(payload, &extensions, &mut result.decision_log, verdict)
+                .await;
+            result.modified_extensions = Some(extensions);
+        }
+        result.modified_payload = carried;
+        result
+    }
+
     /// Apply the `assertions:` contract in force to a pipeline result.
     ///
     /// Called at **every** return site of every entry point, not only the one
@@ -2400,21 +2474,26 @@ impl PolicyEngine {
     /// belongs after policy evaluation rather than around each step of it.
     /// `matched` is the route the caller already resolved, or `None` where no
     /// route matched, which resolves the global layer alone.
+    ///
+    /// Returns the result alongside the payload a late denial stripped from
+    /// it, if any. A denial carries no payload, but the audit emit still has
+    /// to report the message that was refused, and this is the only path where
+    /// a payload the pipeline allowed is dropped after the fact.
     fn apply_assertions(
         &self,
         snapshot: &RuntimeSnapshot,
         hook_name: Option<&str>,
         matched: Option<&config::MatchedRoute<'_>>,
         mut result: PipelineResult,
-    ) -> PipelineResult {
+    ) -> (PipelineResult, Option<Box<dyn PluginPayload>>) {
         use crate::assertions::Direction;
 
         if !snapshot.declares_assertions {
-            return result;
+            return (result, None);
         }
         let (Some(hook_name), Some(policy_config)) = (hook_name, snapshot.policy_config.as_ref())
         else {
-            return result;
+            return (result, None);
         };
         // The hook's registered phase is the authority, so this feature names no
         // hook: a `Pre` hook asserts toward the upstream, a `Post` hook toward
@@ -2422,7 +2501,7 @@ impl PolicyEngine {
         let Some(direction) = crate::hooks::lookup_hook_metadata(hook_name)
             .and_then(|meta| Direction::from_phase(meta.phase))
         else {
-            return result;
+            return (result, None);
         };
         if let Some(extensions) = result.modified_extensions.as_ref() {
             self.warn_once_if_route_assertions_are_unreachable(
@@ -2435,7 +2514,7 @@ impl PolicyEngine {
         // A denied pipeline forwarded nothing, so there is no upstream response
         // to filter on the way out.
         if denied && direction == Direction::Response {
-            return result;
+            return (result, None);
         }
         // The entity type comes from the request rather than from the matched
         // route, so `global.defaults.http` still governs a generic-HTTP request
@@ -2451,7 +2530,7 @@ impl PolicyEngine {
             entity_type.as_deref(),
             direction,
         ) else {
-            return result;
+            return (result, None);
         };
 
         if denied {
@@ -2462,19 +2541,19 @@ impl PolicyEngine {
             if let Some(extensions) = result.modified_extensions.as_mut() {
                 crate::assertions::apply(&contract, &[], extensions, direction);
             }
-            return result;
+            return (result, None);
         }
 
         let rendered = match result.modified_extensions.as_ref() {
             Some(extensions) => crate::assertions::render(&contract, extensions),
-            None => return result,
+            None => return (result, None),
         };
         match rendered {
             Ok(rendered) => {
                 if let Some(extensions) = result.modified_extensions.as_mut() {
                     crate::assertions::apply(&contract, &rendered, extensions, direction);
                 }
-                result
+                (result, None)
             },
             Err(missing) => {
                 // Strip first. The removal is unconditional, and a refused
@@ -2482,7 +2561,12 @@ impl PolicyEngine {
                 if let Some(extensions) = result.modified_extensions.as_mut() {
                     crate::assertions::apply(&contract, &[], extensions, direction);
                 }
-                deny_missing_assertion(missing, direction, result)
+                // Held back for the emit. `deny_missing_assertion` drops it,
+                // and this is the one denial where the payload reached the
+                // verdict — every other one refused before a payload existed
+                // to report.
+                let refused = result.modified_payload.take();
+                (deny_missing_assertion(missing, direction, result), refused)
             },
         }
     }
@@ -9696,6 +9780,128 @@ routes:
         // The default reconciler cannot confirm it, so it stays for an
         // operator rather than being written off as never having happened.
         assert_eq!(unresolved[0].state, crate::effect::EffectState::Prepared);
+    }
+
+    /// What reconciliation concluded reaches the audit sinks.
+    ///
+    /// The resolving record is appended and compacted away inside the same
+    /// sweep, so the log is not where anyone reads it: an effect that spent a
+    /// restart unaccounted for used to vanish with nobody told which way it
+    /// went. The emit is the only place that answer surfaces.
+    #[tokio::test]
+    async fn a_reconciled_effect_is_emitted_to_the_sinks() {
+        struct Confirming;
+
+        #[async_trait]
+        impl crate::effect::EffectReconciler for Confirming {
+            async fn reconcile(
+                &self,
+                _effect: &crate::effect::EffectRecord,
+            ) -> crate::effect::EffectState {
+                crate::effect::EffectState::Confirmed
+            }
+        }
+
+        #[derive(Default)]
+        struct EffectSinkPlugin {
+            cfg: PluginConfig,
+            seen: Arc<Mutex<Vec<crate::effect::EffectRecord>>>,
+        }
+
+        #[async_trait]
+        impl Plugin for EffectSinkPlugin {
+            fn config(&self) -> &PluginConfig {
+                &self.cfg
+            }
+
+            fn as_audit_handler(self: Arc<Self>) -> Option<Arc<dyn crate::audit::AuditHandler>> {
+                Some(self)
+            }
+        }
+
+        #[async_trait]
+        impl crate::audit::AuditHandler for EffectSinkPlugin {
+            async fn handle(
+                &self,
+                _payload: &dyn PluginPayload,
+                _extensions: &Extensions,
+                _decisions: &crate::decision::DecisionLog,
+            ) {
+            }
+
+            async fn on_effect(
+                &self,
+                effect: &crate::effect::EffectRecord,
+                _extensions: &Extensions,
+            ) {
+                self.seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(effect.clone());
+            }
+        }
+
+        impl HookHandler<TestHook> for EffectSinkPlugin {
+            async fn handle(
+                &self,
+                _payload: &TestPayload,
+                _ext: &Extensions,
+                _ctx: &mut PluginContext,
+            ) -> PluginResult<TestPayload> {
+                PluginResult::allow()
+            }
+        }
+
+        let path = effect_log_path("reconciled_emit");
+        let _c = RemoveOnDrop(path.clone());
+        std::fs::write(
+            &path,
+            br#"{"kind":"token_mint","description":"d","key":"k-1","state":"prepared","details":{},"plugin_name":"delegator"}
+"#,
+        )
+        .unwrap();
+
+        let mut config = PolicyConfig::default();
+        config.engine_settings.effect_log_path = Some(path.display().to_string());
+        let engine = PolicyEngine::default();
+        engine.load_config(config).unwrap();
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let cfg = make_config("effect-sink", 10, PluginMode::Sequential);
+        engine
+            .register_handler::<TestHook, _>(
+                Arc::new(EffectSinkPlugin {
+                    cfg: cfg.clone(),
+                    seen: Arc::clone(&seen),
+                }),
+                cfg,
+            )
+            .unwrap();
+
+        let unresolved = engine.recover_effects_with(&Confirming).await.unwrap();
+
+        assert!(unresolved.is_empty(), "the reconciler answered");
+        let seen = std::mem::take(
+            &mut *seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        assert_eq!(seen.len(), 1, "and the sink was told: {seen:?}");
+        assert_eq!(seen[0].key, "k-1");
+        assert_eq!(seen[0].state, crate::effect::EffectState::Confirmed);
+        assert!(
+            seen[0].stream_seq.is_some(),
+            "stamped into this process's stream, not the one that crashed"
+        );
+        assert!(
+            crate::effect::FileEffectLog::new(&path)
+                .recover()
+                .await
+                .unwrap()
+                .unresolved
+                .is_empty(),
+            "and the pair is compacted out of the log"
+        );
     }
 
     /// A completed effect is not something to reconcile, so recovery drops it.

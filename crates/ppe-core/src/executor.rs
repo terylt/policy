@@ -28,7 +28,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{error, warn};
 
-use crate::audit::AuditHandler;
+use crate::audit::AttachedSink;
 use crate::context::PluginContextTable;
 use crate::decision::{DecisionLog, PluginAction, Verdict};
 use crate::effect::{DurableEffectLog, EffectLogSlot, EffectSink, EffectStream};
@@ -322,7 +322,7 @@ pub struct Executor {
     /// Observation-only sinks invoked at the verdict of every pipeline run.
     /// Set when the engine builds the runtime snapshot, empty otherwise.
     /// They receive the decision log but cannot influence the outcome.
-    audit_handlers: Vec<Arc<dyn AuditHandler>>,
+    audit_handlers: Vec<AttachedSink>,
 
     /// Where an irreversible effect gets recorded. `None` when the operator
     /// configured neither a log nor a sink, in which case a plugin's effects
@@ -416,6 +416,30 @@ impl Executor {
         self.effect_sink.as_ref().and_then(|s| s.log())
     }
 
+    /// Tell the audit sinks what a recovery sweep settled.
+    ///
+    /// Reconciliation is the only place an effect's terminal state is decided
+    /// by something other than the plugin that caused it, and the record
+    /// saying so is compacted away as soon as it is written. Emitting here is
+    /// what makes the answer reach anyone: a mint that spent a restart
+    /// unaccounted for becomes a mint someone can see was confirmed.
+    ///
+    /// Stamped from the live sink, so these carry this process's epoch and
+    /// take their place in the current stream rather than reappearing under
+    /// the sequence numbers of the run that crashed.
+    ///
+    /// There is no request behind a recovery sweep, so sinks see default
+    /// extensions. The record is self-describing, which is what a reconciler
+    /// works from too.
+    pub(crate) async fn emit_reconciled(&self, resolved: Vec<crate::effect::EffectRecord>) {
+        let Some(sink) = self.effect_sink.as_ref() else {
+            return;
+        };
+        for record in resolved {
+            sink.notify(record, &Extensions::default()).await;
+        }
+    }
+
     /// Rebuild the shared sink from the current log and audit handlers.
     ///
     /// The sink is a projection of both, so anything that changes either has
@@ -441,7 +465,7 @@ impl Executor {
 
     /// Attach observation-only audit sinks, invoked at the verdict of every
     /// pipeline run. Used by the engine when it builds the runtime snapshot.
-    pub fn with_audit_handlers(mut self, audit_handlers: Vec<Arc<dyn AuditHandler>>) -> Self {
+    pub fn with_audit_handlers(mut self, audit_handlers: Vec<AttachedSink>) -> Self {
         self.audit_handlers = audit_handlers;
         let log = self.effect_log();
         self.rebuild_effect_sink(log);
@@ -451,38 +475,58 @@ impl Executor {
     /// Replace the attached audit sinks. The engine calls this after a
     /// registry mutation so a sink registered programmatically is attached
     /// on the same terms as one that arrived through config.
-    pub fn set_audit_handlers(&mut self, audit_handlers: Vec<Arc<dyn AuditHandler>>) {
+    pub fn set_audit_handlers(&mut self, audit_handlers: Vec<AttachedSink>) {
         self.audit_handlers = audit_handlers;
         let log = self.effect_log();
         self.rebuild_effect_sink(log);
     }
 
-    /// Emit one allow record for an invocation that resolved to zero plugins,
-    /// so the audit stream carries one record per invocation rather than
-    /// falling silent where nothing was configured.
+    /// Seed a decision log for an invocation that resolved to zero plugins, so
+    /// the audit stream carries one record per invocation rather than falling
+    /// silent where nothing was configured.
     ///
-    /// A no-op when no sink is attached, so an unaudited host pays only a
-    /// length check. The engine calls this at its zero-plugin short-circuits,
-    /// which return before reaching `execute`.
+    /// Returns an empty log when no sink is attached, so an unaudited host
+    /// pays only a length check. The engine calls this at its zero-plugin
+    /// short-circuits, which return before reaching `execute`, and at the
+    /// route-resolution denial, which has no pipeline to build one.
     ///
-    /// The record built here reaches the sinks but is not attached to the
-    /// `PipelineResult`, whose `decision_log` stays empty on this path. That
-    /// is deliberate: populating it would mean deriving a span, and so two
-    /// fresh UUIDs, on every invocation of every hook nothing is configured
-    /// for, which is the common case and the one that should cost nothing.
-    pub(crate) async fn emit_empty_allow(
+    /// The verdict is not set here. Nothing between this and the emit can
+    /// change what a zero-plugin invocation rules, but the contract is that
+    /// only [`Self::emit_decision`] finalizes, so there is one place where a
+    /// record's verdict is decided rather than two that have to agree.
+    pub(crate) fn entry_decisions(
         &self,
         payload: &dyn PluginPayload,
         extensions: &Extensions,
+    ) -> DecisionLog {
+        let mut decisions = DecisionLog::new();
+        self.capture_entry_provenance(&mut decisions, payload, extensions);
+        decisions
+    }
+
+    /// Finalize a decision log with the verdict the caller is actually
+    /// returning, stamp it into the audit stream, and hand it to every sink.
+    ///
+    /// This is the single emit point, and it belongs to the engine rather than
+    /// to `execute`, because the verdict is not final until the engine's
+    /// assertion contract has run. Emitting from inside `execute` recorded an
+    /// allow that `apply_assertions` could still turn into a deny, and said
+    /// nothing at all about a request denied before the pipeline started.
+    ///
+    /// A no-op when no sink is attached.
+    pub(crate) async fn emit_decision(
+        &self,
+        payload: &dyn PluginPayload,
+        extensions: &Extensions,
+        decisions: &mut DecisionLog,
+        verdict: Verdict,
     ) {
         if self.audit_handlers.is_empty() {
             return;
         }
-        let mut decisions = DecisionLog::new();
-        self.capture_entry_provenance(&mut decisions, payload, extensions);
-        decisions.finalize(Verdict::Allow);
-        self.stamp_decision_stream(&mut decisions);
-        self.emit_audit(payload, extensions, &decisions).await;
+        decisions.finalize(verdict);
+        self.stamp_decision_stream(decisions);
+        self.emit_audit(payload, extensions, decisions).await;
     }
 
     /// Record what this invocation started from: its place in the trace, the
@@ -547,21 +591,29 @@ impl Executor {
         // logged and skipped. A lost audit record is a problem in itself, but
         // not one that justifies failing the request.
         let timeout_dur = Duration::from_secs(self.config.timeout_seconds);
-        for handler in &self.audit_handlers {
+        for sink in &self.audit_handlers {
+            // `extensions` here is the executor's working copy: the host's
+            // transport is installed on it and the credential slots are
+            // unfiltered, because each plugin that ran was filtered on the way
+            // in and this is what they were filtered from. A sink is filtered
+            // on the same terms, against its own declared capabilities, and
+            // the filtered view's effect slot is detached so a sink cannot act
+            // under the name of a plugin it is watching.
+            let view = sink.view(extensions);
             let call =
-                AssertUnwindSafe(handler.handle(payload, extensions, decisions)).catch_unwind();
+                AssertUnwindSafe(sink.handler().handle(payload, &view, decisions)).catch_unwind();
             match timeout(timeout_dur, call).await {
                 Ok(Ok(())) => {},
                 Ok(Err(_panic)) => {
                     error!(
                         "audit sink '{}' panicked during emit, contained",
-                        handler.name()
+                        sink.name()
                     );
                 },
                 Err(_elapsed) => {
                     error!(
                         "audit sink '{}' exceeded {}s during emit, skipped",
-                        handler.name(),
+                        sink.name(),
                         timeout_dur.as_secs()
                     );
                 },
@@ -583,10 +635,18 @@ impl Executor {
     ///
     /// A tuple of:
     /// - `PipelineResult` — immutable policy result with payload,
-    ///   extensions, violation, and context table.
+    ///   extensions, violation, and context table. Its `decision_log` carries
+    ///   what every phase recorded, finalized with the verdict the pipeline
+    ///   reached.
     /// - `BackgroundTasks` — handles to fire-and-forget tasks. Call
     ///   `wait_for_background_tasks()` to await them, or drop to let
     ///   them complete in the background.
+    ///
+    /// Nothing is emitted to audit sinks here. The pipeline's verdict is not
+    /// the caller's verdict yet — the engine's assertion contract runs after
+    /// this returns and can still deny — so the log is built here and emitted
+    /// by the engine once the verdict is settled. A host driving this directly
+    /// rather than through `PolicyEngine` owns that emit.
     pub async fn execute(
         &self,
         entries: &[HookEntry],
@@ -595,18 +655,46 @@ impl Executor {
         context_table: Option<PluginContextTable>,
         task_tracker: &tokio_util::task::TaskTracker,
     ) -> (PipelineResult, BackgroundTasks) {
+        let (result, tasks, _refused) = self
+            .execute_audited(entries, payload, extensions, context_table, task_tracker)
+            .await;
+        (result, tasks)
+    }
+
+    /// [`Self::execute`], plus the payload as it stood at the verdict when the
+    /// pipeline denied.
+    ///
+    /// A denial carries no payload out — that is the contract, and a caller
+    /// must not act on a message the pipeline refused. The audit emit is the
+    /// exception that still needs it: a record of a denial that cannot say
+    /// what was denied is most of the way to useless. So the payload comes
+    /// back beside the result rather than inside it, and only the engine's
+    /// emit sees it. `None` on an allow, where the result carries it already.
+    pub(crate) async fn execute_audited(
+        &self,
+        entries: &[HookEntry],
+        payload: Box<dyn PluginPayload>,
+        extensions: Extensions,
+        context_table: Option<PluginContextTable>,
+        task_tracker: &tokio_util::task::TaskTracker,
+    ) -> (
+        PipelineResult,
+        BackgroundTasks,
+        Option<Box<dyn PluginPayload>>,
+    ) {
         let mut ctx_table = context_table.unwrap_or_default();
 
         if entries.is_empty() {
             // A hook resolving to zero plugins is normal (nothing configured
-            // for this entity). It still emits one allow record so the stream
-            // stays dense at one record per invocation. The engine
-            // short-circuits most zero-plugin invocations before reaching
-            // here and emits itself; this covers a direct `execute(&[], ..)`.
-            self.emit_empty_allow(&*payload, &extensions).await;
+            // for this entity). The engine short-circuits these before
+            // reaching here; this covers a direct `execute(&[], ..)`.
+            let mut decisions = self.entry_decisions(&*payload, &extensions);
+            decisions.finalize(Verdict::Allow);
             return (
-                PipelineResult::allowed_with(payload, extensions, ctx_table),
+                PipelineResult::allowed_with(payload, extensions, ctx_table)
+                    .with_decision_log(decisions),
                 BackgroundTasks::empty(),
+                None,
             );
         }
 
@@ -629,8 +717,7 @@ impl Executor {
         // What each plugin did and how the pipeline ruled. Threaded through
         // the phases, finalized at each return point, and attached to the
         // result for audit sinks.
-        let mut decisions = DecisionLog::new();
-        self.capture_entry_provenance(&mut decisions, &*current_payload, &current_extensions);
+        let mut decisions = self.entry_decisions(&*current_payload, &current_extensions);
 
         if let Some(v) = self
             .run_serial_phase(
@@ -648,14 +735,12 @@ impl Executor {
             .await
         {
             decisions.finalize(Verdict::Deny(v.clone()));
-            self.stamp_decision_stream(&mut decisions);
-            self.emit_audit(&*current_payload, &current_extensions, &decisions)
-                .await;
             return (
                 PipelineResult::denied(v, current_extensions, ctx_table)
                     .with_errors(errors)
                     .with_decision_log(decisions),
                 BackgroundTasks::empty(),
+                Some(current_payload),
             );
         }
 
@@ -697,14 +782,12 @@ impl Executor {
             .await
         {
             decisions.finalize(Verdict::Deny(violation.clone()));
-            self.stamp_decision_stream(&mut decisions);
-            self.emit_audit(&*current_payload, &current_extensions, &decisions)
-                .await;
             return (
                 PipelineResult::denied(violation, current_extensions, ctx_table)
                     .with_errors(errors)
                     .with_decision_log(decisions),
                 BackgroundTasks::empty(),
+                Some(current_payload),
             );
         }
 
@@ -720,15 +803,13 @@ impl Executor {
         );
 
         decisions.finalize(Verdict::Allow);
-        self.stamp_decision_stream(&mut decisions);
-        self.emit_audit(&*current_payload, &current_extensions, &decisions)
-            .await;
         (
             PipelineResult::allowed_with(current_payload, current_extensions, ctx_table)
                 .with_errors(errors)
                 .with_decision_log(decisions)
                 .with_payload_modified(payload_modified),
             BackgroundTasks::from_handles(bg_handles),
+            None,
         )
     }
 
@@ -2159,6 +2240,7 @@ mod audit_seam_tests {
     use async_trait::async_trait;
 
     use super::*;
+    use crate::audit::AuditHandler;
     use crate::context::PluginContext;
     use crate::decision::DecisionStep;
     use crate::error::PluginViolation;
@@ -2277,21 +2359,52 @@ mod audit_seam_tests {
         }
     }
 
-    async fn run(
+    /// A sink declaring no capabilities, which is what an audit plugin that
+    /// only records verdicts needs.
+    fn sink(handler: Arc<dyn AuditHandler>) -> AttachedSink {
+        AttachedSink::new(handler, std::collections::HashSet::new())
+    }
+
+    /// Run the pipeline and emit the way `PolicyEngine::finish` does.
+    ///
+    /// `execute` builds the decision log and stops there, because the verdict
+    /// is not final until the engine's assertion contract has run. Tests that
+    /// assert on what a sink saw have to drive the emit themselves.
+    async fn execute_and_emit(
+        executor: &Executor,
         entries: &[HookEntry],
-        sinks: Vec<Arc<dyn AuditHandler>>,
-    ) -> (PipelineResult, DecisionLog) {
+        payload: Box<dyn PluginPayload>,
+        extensions: Extensions,
+    ) -> PipelineResult {
+        let tracker = tokio_util::task::TaskTracker::new();
+        let (mut result, _bg, refused) = executor
+            .execute_audited(entries, payload, extensions, None, &tracker)
+            .await;
+        let verdict = match result.violation.as_ref() {
+            Some(v) => Verdict::Deny(v.clone()),
+            None => Verdict::Allow,
+        };
+        let carried = result.modified_payload.take();
+        let ext = result.modified_extensions.take().unwrap_or_default();
+        if let Some(p) = carried.as_deref().or(refused.as_deref()) {
+            executor
+                .emit_decision(p, &ext, &mut result.decision_log, verdict)
+                .await;
+        }
+        result.modified_extensions = Some(ext);
+        result.modified_payload = carried;
+        result
+    }
+
+    async fn run(entries: &[HookEntry], sinks: Vec<AttachedSink>) -> (PipelineResult, DecisionLog) {
         let executor = Executor::new(ExecutorConfig {
             timeout_seconds: 5,
             short_circuit_on_deny: true,
             ..Default::default()
         })
         .with_audit_handlers(sinks);
-        let tracker = tokio_util::task::TaskTracker::new();
         let payload: Box<dyn PluginPayload> = Box::new(P("in".into()));
-        let (result, _bg) = executor
-            .execute(entries, payload, Extensions::default(), None, &tracker)
-            .await;
+        let result = execute_and_emit(&executor, entries, payload, Extensions::default()).await;
         let log = result.decision_log.clone();
         (result, log)
     }
@@ -2303,7 +2416,7 @@ mod audit_seam_tests {
             entry("a", PluginMode::Sequential, Act::Allow),
             entry("b", PluginMode::Sequential, Act::Allow),
         ];
-        let (result, _) = run(&entries, vec![rec.clone()]).await;
+        let (result, _) = run(&entries, vec![sink(rec.clone())]).await;
 
         assert!(result.continue_processing);
         let calls = rec.calls();
@@ -2330,7 +2443,7 @@ mod audit_seam_tests {
             entry("blocker", PluginMode::Sequential, Act::Deny),
             entry("never", PluginMode::Sequential, Act::Allow),
         ];
-        let (result, log) = run(&entries, vec![rec.clone()]).await;
+        let (result, log) = run(&entries, vec![sink(rec.clone())]).await;
 
         assert!(result.is_denied());
         let calls = rec.calls();
@@ -2359,7 +2472,7 @@ mod audit_seam_tests {
     async fn a_concurrent_deny_emits_a_record() {
         let rec = Arc::new(Recorder::default());
         let entries = [entry("gate", PluginMode::Concurrent, Act::Deny)];
-        let (result, _) = run(&entries, vec![rec.clone()]).await;
+        let (result, _) = run(&entries, vec![sink(rec.clone())]).await;
 
         assert!(result.is_denied());
         let calls = rec.calls();
@@ -2375,7 +2488,7 @@ mod audit_seam_tests {
     async fn a_block_from_transform_is_recorded_as_deny_ignored() {
         let rec = Arc::new(Recorder::default());
         let entries = [entry("shaper", PluginMode::Transform, Act::Deny)];
-        let (result, _) = run(&entries, vec![rec.clone()]).await;
+        let (result, _) = run(&entries, vec![sink(rec.clone())]).await;
 
         assert!(result.continue_processing, "transform cannot block");
         let calls = rec.calls();
@@ -2402,7 +2515,7 @@ mod audit_seam_tests {
             entry("gate_a", PluginMode::Concurrent, Act::Deny),
             entry("gate_b", PluginMode::Concurrent, Act::Deny),
         ];
-        let (result, _) = run(&entries, vec![rec.clone()]).await;
+        let (result, _) = run(&entries, vec![sink(rec.clone())]).await;
 
         assert!(result.is_denied());
         let calls = rec.calls();
@@ -2425,7 +2538,7 @@ mod audit_seam_tests {
     async fn a_payload_modification_is_recorded_as_such() {
         let rec = Arc::new(Recorder::default());
         let entries = [entry("shaper", PluginMode::Transform, Act::ModifyPayload)];
-        let (_, _) = run(&entries, vec![rec.clone()]).await;
+        let (_, _) = run(&entries, vec![sink(rec.clone())]).await;
 
         assert_eq!(rec.calls()[0].1[0].action, PluginAction::ModifiedPayload);
     }
@@ -2434,7 +2547,7 @@ mod audit_seam_tests {
     async fn a_plugin_error_is_recorded_as_an_error_step() {
         let rec = Arc::new(Recorder::default());
         let entries = [entry("flaky", PluginMode::Sequential, Act::Error)];
-        let (result, _) = run(&entries, vec![rec.clone()]).await;
+        let (result, _) = run(&entries, vec![sink(rec.clone())]).await;
 
         assert!(result.continue_processing, "on_error: ignore continues");
         assert!(matches!(rec.calls()[0].1[0].action, PluginAction::Error(_)));
@@ -2446,7 +2559,7 @@ mod audit_seam_tests {
     #[tokio::test]
     async fn a_zero_plugin_run_emits_one_allow_record() {
         let rec = Arc::new(Recorder::default());
-        let (_, _) = run(&[], vec![rec.clone()]).await;
+        let (_, _) = run(&[], vec![sink(rec.clone())]).await;
 
         let calls = rec.calls();
         assert_eq!(calls.len(), 1);
@@ -2458,7 +2571,11 @@ mod audit_seam_tests {
     async fn a_panicking_sink_does_not_disturb_the_verdict() {
         let rec = Arc::new(Recorder::default());
         let entries = [entry("a", PluginMode::Sequential, Act::Allow)];
-        let (result, _) = run(&entries, vec![Arc::new(PanickingSink), rec.clone()]).await;
+        let (result, _) = run(
+            &entries,
+            vec![sink(Arc::new(PanickingSink)), sink(rec.clone())],
+        )
+        .await;
 
         assert!(result.continue_processing, "the request survives the sink");
         assert_eq!(
@@ -2738,7 +2855,7 @@ mod audit_seam_tests {
             handler: Arc::new(Panicker(cfg)),
         };
         let rec = Arc::new(Recorder::default());
-        let (result, _) = run(std::slice::from_ref(&entry), vec![rec.clone()]).await;
+        let (result, _) = run(std::slice::from_ref(&entry), vec![sink(rec.clone())]).await;
 
         let violation = result
             .violation
@@ -2782,13 +2899,10 @@ mod audit_seam_tests {
             timeout_seconds: 5,
             ..Default::default()
         })
-        .with_audit_handlers(vec![rec.clone()]);
-        let tracker = tokio_util::task::TaskTracker::new();
+        .with_audit_handlers(vec![sink(rec.clone())]);
         let payload: Box<dyn PluginPayload> = Box::new(P("in".into()));
         let entries = [entry("a", PluginMode::Sequential, Act::Allow)];
-        let (result, _bg) = executor
-            .execute(&entries, payload, extensions, None, &tracker)
-            .await;
+        let result = execute_and_emit(&executor, &entries, payload, extensions).await;
 
         let log = result.decision_log;
         let span = log.span().expect("the executor stamps a span");
@@ -2848,7 +2962,7 @@ mod audit_seam_tests {
             timeout_seconds: 5,
             ..Default::default()
         })
-        .with_audit_handlers(vec![Arc::new(Recorder::default())]);
+        .with_audit_handlers(vec![sink(Arc::new(Recorder::default()))]);
         let tracker = tokio_util::task::TaskTracker::new();
         let payload: Box<dyn PluginPayload> = Box::new(P("in".into()));
         let entries = [entry("a", PluginMode::Sequential, Act::Allow)];
@@ -2872,7 +2986,7 @@ mod audit_seam_tests {
             capture_content_provenance: true,
             ..Default::default()
         })
-        .with_audit_handlers(vec![Arc::new(Recorder::default())]);
+        .with_audit_handlers(vec![sink(Arc::new(Recorder::default()))]);
         let tracker = tokio_util::task::TaskTracker::new();
         let payload: Box<dyn PluginPayload> = Box::new(P("in".into()));
         let entries = [entry("a", PluginMode::Sequential, Act::Allow)];
@@ -2892,7 +3006,7 @@ mod audit_seam_tests {
             capture_content_provenance: true,
             ..Default::default()
         })
-        .with_audit_handlers(vec![Arc::new(Recorder::default())]);
+        .with_audit_handlers(vec![sink(Arc::new(Recorder::default()))]);
         let tracker = tokio_util::task::TaskTracker::new();
         let payload: Box<dyn PluginPayload> = Box::new(MessagePayload {
             message: Message::with_content(Role::User, Vec::new()),
@@ -2920,12 +3034,8 @@ mod audit_seam_tests {
     // dropped record from a quiet period, which is the whole point.
 
     async fn run_with(executor: &Executor, entries: &[HookEntry]) -> PipelineResult {
-        let tracker = tokio_util::task::TaskTracker::new();
         let payload: Box<dyn PluginPayload> = Box::new(P("in".into()));
-        let (result, _bg) = executor
-            .execute(entries, payload, Extensions::default(), None, &tracker)
-            .await;
-        result
+        execute_and_emit(executor, entries, payload, Extensions::default()).await
     }
 
     #[tokio::test]
@@ -2934,7 +3044,7 @@ mod audit_seam_tests {
             timeout_seconds: 5,
             ..Default::default()
         })
-        .with_audit_handlers(vec![Arc::new(Recorder::default())]);
+        .with_audit_handlers(vec![sink(Arc::new(Recorder::default()))]);
         let entries = [entry("a", PluginMode::Sequential, Act::Allow)];
 
         let mut seqs = Vec::new();
@@ -2952,7 +3062,7 @@ mod audit_seam_tests {
             timeout_seconds: 5,
             ..Default::default()
         })
-        .with_audit_handlers(vec![Arc::new(Recorder::default())]);
+        .with_audit_handlers(vec![sink(Arc::new(Recorder::default()))]);
         let entries = [entry("a", PluginMode::Sequential, Act::Allow)];
 
         let log = run_with(&executor, &entries).await.decision_log;
@@ -2971,7 +3081,7 @@ mod audit_seam_tests {
             audit_stream_namespace: Some("gw-1".to_owned()),
             ..Default::default()
         })
-        .with_audit_handlers(vec![Arc::new(Recorder::default())]);
+        .with_audit_handlers(vec![sink(Arc::new(Recorder::default()))]);
         let entries = [entry("a", PluginMode::Sequential, Act::Allow)];
 
         let log = run_with(&executor, &entries).await.decision_log;
@@ -2995,7 +3105,7 @@ mod audit_seam_tests {
         // Attaching a sink now starts the stream at zero, because the earlier
         // invocations emitted nothing and so consumed no sequence number.
         let mut executor = executor;
-        executor.set_audit_handlers(vec![Arc::new(Recorder::default())]);
+        executor.set_audit_handlers(vec![sink(Arc::new(Recorder::default()))]);
         let log = run_with(&executor, &entries).await.decision_log;
 
         assert_eq!(log.stream_seq(), Some(0));
@@ -3009,7 +3119,7 @@ mod audit_seam_tests {
             timeout_seconds: 5,
             ..Default::default()
         })
-        .with_audit_handlers(vec![Arc::new(Recorder::default())]);
+        .with_audit_handlers(vec![sink(Arc::new(Recorder::default()))]);
 
         let allowed = [entry("a", PluginMode::Sequential, Act::Allow)];
         let denied = [entry("b", PluginMode::Sequential, Act::Deny)];
@@ -3051,7 +3161,7 @@ mod audit_seam_tests {
             timeout_seconds: 5,
             ..Default::default()
         })
-        .with_audit_handlers(vec![Arc::new(Recorder::default())])
+        .with_audit_handlers(vec![sink(Arc::new(Recorder::default()))])
         .with_effect_log(log.clone());
 
         let acted = Arc::new(std::sync::atomic::AtomicBool::new(false));
