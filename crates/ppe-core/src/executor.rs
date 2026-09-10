@@ -3156,12 +3156,37 @@ mod audit_seam_tests {
             }
         }
 
+        /// A sink that keeps the effect records it was handed. The stream
+        /// position lives on what a sink sees, so that is where it is read.
+        #[derive(Default)]
+        struct EffectSpy(Mutex<Vec<crate::effect::EffectRecord>>);
+
+        #[async_trait]
+        impl AuditHandler for EffectSpy {
+            async fn handle(
+                &self,
+                _payload: &dyn PluginPayload,
+                _extensions: &Extensions,
+                _decisions: &DecisionLog,
+            ) {
+            }
+
+            async fn on_effect(
+                &self,
+                effect: &crate::effect::EffectRecord,
+                _extensions: &Extensions,
+            ) {
+                self.0.lock().unwrap().push(effect.clone());
+            }
+        }
+
         let log = Arc::new(SpyLog::default());
+        let spy = Arc::new(EffectSpy::default());
         let executor = Executor::new(ExecutorConfig {
             timeout_seconds: 5,
             ..Default::default()
         })
-        .with_audit_handlers(vec![sink(Arc::new(Recorder::default()))])
+        .with_audit_handlers(vec![sink(spy.clone())])
         .with_effect_log(log.clone());
 
         let acted = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3191,7 +3216,7 @@ mod audit_seam_tests {
         let decision = run_with(&executor, std::slice::from_ref(&entry))
             .await
             .decision_log;
-        let effects = log.0.lock().unwrap().clone();
+        let effects = spy.0.lock().unwrap().clone();
 
         // The mint recorded an intent and an outcome, taking emission 0 and 1,
         // and the decision that contained them was emitted after, taking 2.
@@ -3205,5 +3230,116 @@ mod audit_seam_tests {
         assert_eq!(effects[1].stream_seq, Some(1));
         assert_eq!(decision.stream_seq(), Some(0));
         assert_eq!(effects[0].stream_id.as_deref(), Some("effect"));
+
+        // The durable record carries no position, because the position is a
+        // property of the stream a sink reconstructs and not of the write-ahead
+        // record of what was attempted.
+        let written = log.0.lock().unwrap().clone();
+        assert_eq!(written.len(), 2);
+        assert!(written.iter().all(|r| r.stream_seq.is_none()));
+    }
+
+    /// A refused write must not leave a hole in the stream.
+    ///
+    /// `begin_effect` is fail-closed, so a log that cannot take the intent
+    /// correctly stops the act. Stamping before the append still spent a
+    /// sequence number on it, and nothing was ever emitted under that number —
+    /// so an ordinary disk error produced a gap, which a consumer holding the
+    /// history is required to surface as a crashed emitter, a dropped record,
+    /// or tampering.
+    #[tokio::test]
+    async fn a_refused_append_does_not_consume_a_sequence_number() {
+        #[derive(Debug)]
+        struct FlakyLog(std::sync::atomic::AtomicUsize);
+
+        #[async_trait]
+        impl crate::effect::DurableEffectLog for FlakyLog {
+            async fn append(
+                &self,
+                _effect: &crate::effect::EffectRecord,
+            ) -> Result<(), Box<PluginError>> {
+                if self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                    return Err(Box::new(PluginError::Config {
+                        message: "the disk said no".into(),
+                    }));
+                }
+                Ok(())
+            }
+        }
+
+        #[derive(Default)]
+        struct EffectSpy(Mutex<Vec<crate::effect::EffectRecord>>);
+
+        #[async_trait]
+        impl AuditHandler for EffectSpy {
+            async fn handle(
+                &self,
+                _payload: &dyn PluginPayload,
+                _extensions: &Extensions,
+                _decisions: &DecisionLog,
+            ) {
+            }
+
+            async fn on_effect(
+                &self,
+                effect: &crate::effect::EffectRecord,
+                _extensions: &Extensions,
+            ) {
+                self.0.lock().unwrap().push(effect.clone());
+            }
+        }
+
+        let spy = Arc::new(EffectSpy::default());
+        let executor = Executor::new(ExecutorConfig {
+            timeout_seconds: 5,
+            ..Default::default()
+        })
+        .with_audit_handlers(vec![sink(spy.clone())])
+        .with_effect_log(Arc::new(FlakyLog(std::sync::atomic::AtomicUsize::new(0))));
+
+        let acted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cfg = PluginConfig {
+            name: "minter".into(),
+            mode: PluginMode::Sequential,
+            on_error: OnError::Ignore,
+            ..Default::default()
+        };
+        let entry = HookEntry {
+            plugin_ref: Arc::new(PluginRef::new(
+                Arc::new(EffectPlugin {
+                    cfg: cfg.clone(),
+                    acted: Arc::clone(&acted),
+                    refused: Arc::clone(&refused),
+                }),
+                cfg,
+            )),
+            handler: Arc::new(EffectPlugin {
+                cfg: PluginConfig::default(),
+                acted,
+                refused,
+            }),
+        };
+
+        // The first append is refused, so the intent is never recorded and the
+        // act never runs. The second invocation's intent lands.
+        run_with(&executor, std::slice::from_ref(&entry)).await;
+        run_with(&executor, std::slice::from_ref(&entry)).await;
+
+        let effects = spy.0.lock().unwrap().clone();
+        assert!(
+            !effects.is_empty(),
+            "the second invocation reached the sink"
+        );
+        assert_eq!(
+            effects[0].stream_seq,
+            Some(0),
+            "the stream opens at 0: the refused write took no number with it"
+        );
+        let seqs: Vec<u64> = effects.iter().filter_map(|r| r.stream_seq).collect();
+        assert!(
+            seqs.windows(2).all(|w| w[1] == w[0] + 1),
+            "and stays dense: {seqs:?}"
+        );
     }
 }

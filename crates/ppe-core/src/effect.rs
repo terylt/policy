@@ -908,11 +908,9 @@ impl crate::hooks::payload::Extensions {
         };
 
         let mut record = effect.clone().into_state(state);
-        // Attribution and stream identity both come from the executor, so a
-        // record cannot claim to come from a plugin that did not produce it,
-        // nor place itself anywhere it likes in the stream.
+        // Attribution comes from the executor, so a record cannot claim to come
+        // from a plugin that did not produce it.
         record.plugin_name = Some(plugin_name.to_string());
-        sink.stamp(&mut record);
 
         // Durability first. A sink that saw the event while the log rejected
         // it would report an act the write-ahead guarantee says never happened.
@@ -920,6 +918,24 @@ impl crate::hooks::payload::Extensions {
             log.append(&record).await?;
         }
 
+        // Stamped only now, because taking a sequence number is a promise to
+        // emit the record that holds it.
+        //
+        // `stream_seq` is dense per (epoch, stream_id) and opens at 0, and a
+        // consumer holding the history is required to treat a gap as a crashed
+        // emitter, a dropped record, or tampering rather than renumber around
+        // it. Stamping before the append broke that for an ordinary reason: a
+        // refused write is fail-closed, so the act correctly does not happen —
+        // but the number was already spent and nothing was ever emitted under
+        // it, leaving a hole a verifier has to read as evidence of something
+        // far worse than the disk error it actually was.
+        //
+        // The cost is that the durable record carries no stream position. That
+        // is the right side to lose it on: the log is the write-ahead record of
+        // what was attempted, recovery re-stamps whatever it resolves into the
+        // live stream anyway, and the position only means anything in the
+        // stream a sink is reconstructing.
+        sink.stamp(&mut record);
         sink.dispatch(&record, self).await;
         Ok(())
     }

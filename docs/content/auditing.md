@@ -117,6 +117,20 @@ act it guarded never proceeded. A line that will not parse anywhere else is
 corruption, and recovery refuses rather than silently dropping a record that
 accounts for an irreversible act.
 
+Getting that wrong costs more than an unbounded file. A recovery that cannot
+complete never runs reconciliation either, and since reconciliation results are
+emitted to the sinks, the stream a consumer is verifying either falls quiet on
+those transitions or carries an intent that was in fact settled. So the tolerance
+for a torn tail is load-bearing for the evidence, not only for compaction.
+
+The durable record carries no stream position. Positions are stamped when a
+record is handed to the sinks, which is the stream they describe; the log is the
+write-ahead record of what was attempted, and recovery re-stamps whatever it
+resolves into the live stream anyway. Stamping earlier meant a refused write —
+fail-closed, so the act correctly did not happen — still spent a sequence number
+that nothing was ever emitted under, and a gap has to be read as something far
+worse than the disk error it was.
+
 What reconciliation concludes is emitted to the sinks. The resolving record is
 appended and compacted away inside the same sweep, so the log is not where
 anyone reads it — without the emit, an effect that spent a restart unaccounted
@@ -242,6 +256,12 @@ and `emission_seq` to order, never the reverse.
 by the namespace when one is configured. The type suffix always survives, so a
 consumer recovering it splits on the last colon rather than the first, since a
 namespace may contain one.
+
+A transition that recovery settled rides the `effect` stream like any other
+effect record, dense with them and stamped from the live process, not the one
+that crashed. It is not interleaved onto `decision`, and it does not get a
+counter of its own: `stream_seq` is dense per `(epoch, stream_id)`, so a
+per-record-kind counter would break exactly the check it exists for.
 
 An effect is its own event:
 
