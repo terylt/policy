@@ -84,10 +84,29 @@ plugins:
   - name: audit
     kind: audit/logger
     mode: audit
+    capabilities:
+      - read_subject           # sub / roles / teams
+      - read_client            # client_id / client_name
+      - read_labels            # the taint diff
+      - read_delegated_tokens  # which audience got which scopes
     config:
       destination: stderr      # or `tracing`
       source: gateway-eu-1     # optional, stamped on every record
 ```
+
+**A sink declares what it reads, like any other plugin.** The extensions it is
+handed are filtered against its own `capabilities:`, so a sink that declares
+nothing still runs, still emits a record per invocation, and still chains and
+signs — with the gated fields simply absent. Nothing fails, and that is the
+problem: a reader of the resulting record cannot tell "no delegation happened"
+from "the sink was not permitted to see the delegation." Absence of evidence and
+evidence of absence are the same bytes.
+
+So work out which slots a sink reads and grant exactly those. `agent`,
+`delegation`, `http`, `raw_credentials` and the `security` sub-fields — subject,
+client, workload, labels — each need their grant. A verdict, the ordered plugin
+actions, the entity called and the stream position need none, so a sink that
+records only those is complete with no capabilities at all.
 
 Any plugin becomes a sink by overriding `Plugin::as_audit_handler`. A sink has
 two entry points. `handle` receives every decision. `on_effect` receives every
